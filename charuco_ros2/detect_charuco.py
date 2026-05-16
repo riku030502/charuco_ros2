@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 import cv2
+import json
 import numpy as np
+import os
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
 
 from cv_bridge import CvBridge
-from tf2_ros import TransformBroadcaster
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformBroadcaster,
+    TransformListener,
+)
 
 from scipy.spatial.transform import Rotation as R
 
@@ -29,6 +40,14 @@ class CharucoDetectorNode(Node):
         self.declare_parameter("child_frame", "charuco_board")
         self.declare_parameter("auto_assign_child_frame", True)
         self.declare_parameter("publish_camera_link_tf", True)
+        self.declare_parameter("publish_world_camera_tf", True)
+        self.declare_parameter("world_frame", "world")
+        self.declare_parameter("world_lookup_timeout", 0.02)
+        self.declare_parameter(
+            "world_tf_cache_file",
+            "charuco_ros2/config/world_camera_tfs.json"
+        )
+        self.declare_parameter("saved_world_tf_publish_rate", 10.0)
         self.declare_parameter("camera_link_offset_x", 0.052)  # [m]
         self.declare_parameter("camera_link_offset_y", 0.067)  # [m]
         self.declare_parameter("camera_link_offset_z", 0.0)    # [m]
@@ -53,6 +72,19 @@ class CharucoDetectorNode(Node):
         self.publish_camera_link_tf = (
             self.get_parameter("publish_camera_link_tf").value
         )
+        self.publish_world_camera_tf = (
+            self.get_parameter("publish_world_camera_tf").value
+        )
+        self.world_frame = self.get_parameter("world_frame").value
+        self.world_lookup_timeout = float(
+            self.get_parameter("world_lookup_timeout").value
+        )
+        self.world_tf_cache_file = os.path.expanduser(
+            self.get_parameter("world_tf_cache_file").value
+        )
+        self.saved_world_tf_publish_rate = float(
+            self.get_parameter("saved_world_tf_publish_rate").value
+        )
         self.camera_link_offset = (
             self.get_parameter("camera_link_offset_x").value,
             self.get_parameter("camera_link_offset_y").value,
@@ -67,7 +99,6 @@ class CharucoDetectorNode(Node):
             ],
             degrees=True
         ).as_quat()
-
         self.squares_x = self.get_parameter("squares_x").value
         self.squares_y = self.get_parameter("squares_y").value
         self.square_length = self.get_parameter("square_length").value
@@ -127,6 +158,10 @@ class CharucoDetectorNode(Node):
         # =========================
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.saved_world_transforms = {}
+        self.load_saved_world_transforms()
 
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
@@ -148,6 +183,13 @@ class CharucoDetectorNode(Node):
             10
         )
 
+        self.saved_tf_timer = None
+        if self.saved_world_tf_publish_rate > 0.0:
+            self.saved_tf_timer = self.create_timer(
+                1.0 / self.saved_world_tf_publish_rate,
+                self.publish_saved_world_transforms
+            )
+
         self.get_logger().info("ChArUco detector node started")
         self.get_logger().info(f"image_topic: {self.image_topic}")
         self.get_logger().info(f"camera_info_topic: {self.camera_info_topic}")
@@ -156,6 +198,13 @@ class CharucoDetectorNode(Node):
         self.get_logger().info(f"marker_length: {self.marker_length} m")
         self.get_logger().info(
             f"auto_assign_child_frame: {self.auto_assign_child_frame}"
+        )
+        self.get_logger().info(
+            f"publish_world_camera_tf: {self.publish_world_camera_tf}, "
+            f"world_frame: {self.world_frame}"
+        )
+        self.get_logger().info(
+            f"world_tf_cache_file: {self.world_tf_cache_file}"
         )
 
     def camera_info_callback(self, msg: CameraInfo):
@@ -178,12 +227,20 @@ class CharucoDetectorNode(Node):
     def image_callback(self, msg: Image):
         if not self.camera_info_received:
             self.get_logger().warn("Waiting for CameraInfo...", throttle_duration_sec=2.0)
+            self.publish_saved_world_transforms(
+                msg.header.stamp,
+                "waiting for CameraInfo"
+            )
             return
 
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
             self.get_logger().error(f"cv_bridge error: {e}")
+            self.publish_saved_world_transforms(
+                msg.header.stamp,
+                "cv_bridge conversion failed"
+            )
             return
 
         debug_frame = frame.copy()
@@ -209,11 +266,11 @@ class CharucoDetectorNode(Node):
                     marker_ids
                 )
                 if board_config is None:
-                    self.get_logger().debug(
-                        "Detected markers did not match any configured marker ID range",
-                        throttle_duration_sec=1.0
+                    self.handle_detection_failure(
+                        msg,
+                        debug_frame,
+                        "detected markers did not match any configured marker ID range"
                     )
-                    self.publish_debug_image(debug_frame, msg.header)
                     return
 
                 selected_board = board_config["board"]
@@ -230,18 +287,22 @@ class CharucoDetectorNode(Node):
                 selected_detector.detectBoard(gray)
             )
         except cv2.error as e:
-            self.get_logger().debug(
-                f"ChArUco detection skipped: {e}",
-                throttle_duration_sec=2.0
+            self.handle_detection_failure(
+                msg,
+                debug_frame,
+                f"ChArUco detection skipped: {e}"
             )
-            self.publish_debug_image(debug_frame, msg.header)
             return
 
         if marker_ids is not None and len(marker_ids) > 0:
             cv2.aruco.drawDetectedMarkers(debug_frame, marker_corners, marker_ids)
 
         if charuco_ids is None or len(charuco_ids) < 6:
-            self.publish_debug_image(debug_frame, msg.header)
+            self.handle_detection_failure(
+                msg,
+                debug_frame,
+                "not enough ChArUco corners"
+            )
             return
 
         cv2.aruco.drawDetectedCornersCharuco(
@@ -271,15 +332,19 @@ class CharucoDetectorNode(Node):
                 self.dist_coeffs
             )
         except cv2.error as e:
-            self.get_logger().debug(
-                f"ChArUco pose estimation skipped: {e}",
-                throttle_duration_sec=2.0
+            self.handle_detection_failure(
+                msg,
+                debug_frame,
+                f"ChArUco pose estimation skipped: {e}"
             )
-            self.publish_debug_image(debug_frame, msg.header)
             return
 
         if not success:
-            self.publish_debug_image(debug_frame, msg.header)
+            self.handle_detection_failure(
+                msg,
+                debug_frame,
+                "solvePnP failed"
+            )
             return
 
         # 座標軸を描画
@@ -292,7 +357,13 @@ class CharucoDetectorNode(Node):
             0.03
         )
 
-        self.publish_tf(msg, rvec, tvec, child_frame_id, camera_link_frame_id)
+        self.publish_tf(
+            msg,
+            rvec,
+            tvec,
+            child_frame_id,
+            camera_link_frame_id,
+        )
 
         self.get_logger().info(
             f"Detected ChArUco: tvec = "
@@ -378,7 +449,11 @@ class CharucoDetectorNode(Node):
 
         transforms = [transform]
 
-        if self.publish_camera_link_tf and camera_link_frame_id:
+        if (
+            self.publish_camera_link_tf
+            and camera_link_frame_id
+            and not self.publish_world_camera_tf
+        ):
             camera_link_transform = TransformStamped()
             camera_link_transform.header.stamp = image_msg.header.stamp
             camera_link_transform.header.frame_id = child_frame_id
@@ -407,7 +482,247 @@ class CharucoDetectorNode(Node):
             )
             transforms.append(camera_link_transform)
 
+        if self.publish_world_camera_tf and camera_link_frame_id:
+            world_camera_transform = self.create_world_camera_transform(
+                image_msg,
+                transform,
+                camera_link_frame_id,
+            )
+            if world_camera_transform is not None:
+                transforms.append(world_camera_transform)
+                self.save_world_transform(world_camera_transform)
+
         self.tf_broadcaster.sendTransform(transforms)
+
+    def create_world_camera_transform(self, image_msg: Image,
+                                      parent_to_charuco: TransformStamped,
+                                      camera_link_frame_id):
+        try:
+            world_to_parent = self.tf_buffer.lookup_transform(
+                self.world_frame,
+                parent_to_charuco.header.frame_id,
+                Time(),
+                timeout=Duration(seconds=self.world_lookup_timeout),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().debug(
+                f"World TF lookup skipped: {self.world_frame} -> "
+                f"{parent_to_charuco.header.frame_id}: {e}",
+                throttle_duration_sec=2.0
+            )
+            return None
+
+        world_t_parent, world_r_parent = self.transform_to_pose(world_to_parent)
+        parent_t_charuco, parent_r_charuco = self.transform_to_pose(
+            parent_to_charuco
+        )
+        world_t_charuco = (
+            world_t_parent + world_r_parent.apply(parent_t_charuco)
+        )
+        world_r_charuco = world_r_parent * parent_r_charuco
+        charuco_t_camera = np.array(self.camera_link_offset, dtype=np.float64)
+        charuco_r_camera = R.from_quat(self.camera_link_quat)
+        world_t_camera = (
+            world_t_charuco + world_r_charuco.apply(charuco_t_camera)
+        )
+        world_r_camera = world_r_charuco * charuco_r_camera
+
+        transform = TransformStamped()
+        transform.header.stamp = image_msg.header.stamp
+        transform.header.frame_id = self.world_frame
+        transform.child_frame_id = camera_link_frame_id
+        transform.transform.translation.x = float(world_t_camera[0])
+        transform.transform.translation.y = float(world_t_camera[1])
+        transform.transform.translation.z = float(world_t_camera[2])
+
+        quat = world_r_camera.as_quat()
+        transform.transform.rotation.x = float(quat[0])
+        transform.transform.rotation.y = float(quat[1])
+        transform.transform.rotation.z = float(quat[2])
+        transform.transform.rotation.w = float(quat[3])
+        return transform
+
+    def transform_to_pose(self, transform: TransformStamped):
+        translation = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ], dtype=np.float64)
+        rotation = R.from_quat([
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ])
+        return translation, rotation
+
+    def handle_detection_failure(self, image_msg: Image, debug_frame, reason):
+        self.publish_saved_world_transforms(image_msg.header.stamp, reason)
+        self.publish_debug_image(debug_frame, image_msg.header)
+
+    def load_saved_world_transforms(self):
+        if not os.path.exists(self.world_tf_cache_file):
+            self.get_logger().info(
+                f"No saved world TF cache found: {self.world_tf_cache_file}"
+            )
+            return
+
+        try:
+            with open(self.world_tf_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.get_logger().warn(
+                f"Failed to load saved world TF cache "
+                f"{self.world_tf_cache_file}: {e}"
+            )
+            return
+
+        transforms = data.get("transforms", {})
+        if not isinstance(transforms, dict):
+            self.get_logger().warn(
+                f"Saved world TF cache has invalid format: "
+                f"{self.world_tf_cache_file}"
+            )
+            return
+
+        loaded_count = 0
+        for child_frame_id, value in transforms.items():
+            if not self.is_camera_link_frame(child_frame_id):
+                continue
+
+            try:
+                transform = self.transform_from_cache(child_frame_id, value)
+            except (KeyError, TypeError, ValueError) as e:
+                self.get_logger().warn(
+                    f"Skipping invalid saved TF for {child_frame_id}: {e}"
+                )
+                continue
+
+            self.saved_world_transforms[child_frame_id] = transform
+            loaded_count += 1
+
+        self.get_logger().info(
+            f"Loaded {loaded_count} saved world camera link TF(s) from "
+            f"{self.world_tf_cache_file}"
+        )
+
+    def is_camera_link_frame(self, frame_id):
+        return any(
+            frame_id == config["camera_link_frame"]
+            for config in self.board_id_configs
+        )
+
+    def save_world_transform(self, transform: TransformStamped):
+        self.save_world_transforms([transform])
+
+    def save_world_transforms(self, transforms):
+        if not transforms:
+            return
+
+        for transform in transforms:
+            self.saved_world_transforms[transform.child_frame_id] = transform
+
+        data = {
+            "world_frame": self.world_frame,
+            "transforms": {
+                child_frame_id: self.transform_to_cache(saved_transform)
+                for child_frame_id, saved_transform
+                in self.saved_world_transforms.items()
+            }
+        }
+
+        cache_dir = os.path.dirname(self.world_tf_cache_file)
+        try:
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+
+            tmp_file = f"{self.world_tf_cache_file}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_file, self.world_tf_cache_file)
+        except OSError as e:
+            self.get_logger().warn(
+                f"Failed to save world TF cache "
+                f"{self.world_tf_cache_file}: {e}",
+                throttle_duration_sec=2.0
+            )
+            return
+
+        self.get_logger().info(
+            f"Saved {len(transforms)} world TF(s) to "
+            f"{self.world_tf_cache_file}",
+            throttle_duration_sec=2.0
+        )
+
+    def publish_saved_world_transforms(self, stamp=None, reason=None):
+        if not self.publish_world_camera_tf:
+            return False
+
+        if not self.saved_world_transforms:
+            if reason:
+                self.get_logger().warn(
+                    f"ChArUco detection failed ({reason}); no saved world TF "
+                    "is available",
+                    throttle_duration_sec=2.0
+                )
+            return False
+
+        if stamp is None:
+            stamp = self.get_clock().now().to_msg()
+
+        transforms = []
+        for saved_transform in self.saved_world_transforms.values():
+            transform = TransformStamped()
+            transform.header.stamp = stamp
+            transform.header.frame_id = saved_transform.header.frame_id
+            transform.child_frame_id = saved_transform.child_frame_id
+            transform.transform = saved_transform.transform
+            transforms.append(transform)
+
+        self.tf_broadcaster.sendTransform(transforms)
+
+        if reason:
+            child_frames = ", ".join(sorted(self.saved_world_transforms.keys()))
+            self.get_logger().warn(
+                f"ChArUco detection failed ({reason}); publishing saved "
+                f"world TF(s): {child_frames}",
+                throttle_duration_sec=2.0
+            )
+        return True
+
+    def transform_to_cache(self, transform: TransformStamped):
+        return {
+            "parent_frame": transform.header.frame_id,
+            "translation": {
+                "x": transform.transform.translation.x,
+                "y": transform.transform.translation.y,
+                "z": transform.transform.translation.z,
+            },
+            "rotation": {
+                "x": transform.transform.rotation.x,
+                "y": transform.transform.rotation.y,
+                "z": transform.transform.rotation.z,
+                "w": transform.transform.rotation.w,
+            },
+        }
+
+    def transform_from_cache(self, child_frame_id, value):
+        transform = TransformStamped()
+        transform.header.frame_id = value.get("parent_frame", self.world_frame)
+        transform.child_frame_id = child_frame_id
+
+        translation = value["translation"]
+        transform.transform.translation.x = float(translation["x"])
+        transform.transform.translation.y = float(translation["y"])
+        transform.transform.translation.z = float(translation["z"])
+
+        rotation = value["rotation"]
+        transform.transform.rotation.x = float(rotation["x"])
+        transform.transform.rotation.y = float(rotation["y"])
+        transform.transform.rotation.z = float(rotation["z"])
+        transform.transform.rotation.w = float(rotation["w"])
+        return transform
 
     def publish_debug_image(self, frame, header):
         try:
