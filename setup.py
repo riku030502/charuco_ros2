@@ -27,6 +27,7 @@ setup(
             'detect_charuco = charuco_ros2.detect_charuco:main',
             'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
             'detect_apriltag = charuco_ros2.detect_apriltag:main',
+            'move_to_charuco = charuco_ros2.move_to_charuco:main',
         ],
     },
 )
