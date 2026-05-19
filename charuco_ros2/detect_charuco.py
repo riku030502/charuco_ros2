@@ -250,22 +250,29 @@ class CharucoDetectorNode(Node):
                 None,
                 "waiting for CameraInfo"
             )
-            response.success = False
-            response.message = "waiting for CameraInfo"
-            return response
+            return self.set_detect_response(
+                response,
+                False,
+                "waiting for CameraInfo"
+            )
 
         if self.latest_image_msg is None:
             self.publish_saved_world_transforms(
                 None,
                 "no image has been received"
             )
-            response.success = False
-            response.message = "no image has been received"
-            return response
+            return self.set_detect_response(
+                response,
+                False,
+                "no image has been received"
+            )
 
         success, message = self.detect_charuco(self.latest_image_msg)
+        return self.set_detect_response(response, success, message)
+
+    def set_detect_response(self, response, success, detail):
         response.success = success
-        response.message = message
+        response.message = "success" if success else f"false: {detail}"
         return response
 
     def detect_charuco(self, msg: Image):

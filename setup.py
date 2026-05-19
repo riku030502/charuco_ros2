@@ -24,9 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'charuco_detector = charuco_ros2.detect_charuco:main',
-            'charuco_detector_9_7 = charuco_ros2.detect_charuco_9_7:main',
-            'apriltag_detector = charuco_ros2.detect_apriltag:main',
+            'detect_charuco = charuco_ros2.detect_charuco:main',
+            'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
+            'detect_apriltag = charuco_ros2.detect_apriltag:main',
         ],
     },
 )
