@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import threading
+import time
 
 import rclpy
 from control_msgs.action import FollowJointTrajectory
@@ -10,6 +11,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from xarm_msgs.srv import MoveJoint
 
@@ -25,10 +27,14 @@ class MoveToCharucoPoseNode(Node):
         super().__init__("move_to_charuco_pose")
 
         self.declare_parameter("server_service_name", "/move_to_charuco")
-        self.declare_parameter("backend", "auto")
+        self.declare_parameter("backend", "topic")
         self.declare_parameter("xarm_service_name", "auto")
         self.declare_parameter("controller_name", "xarm6_traj_controller")
         self.declare_parameter("joint_prefix", "")
+        self.declare_parameter("joint_state_topic", "/joint_states")
+        self.declare_parameter("joint_state_sync_timeout", 3.0)
+        self.declare_parameter("joint_state_tolerance", 0.02)
+        self.declare_parameter("publish_warmup_time", 1.0)
         self.declare_parameter("input_unit", "deg")
         self.declare_parameter("default_speed", DEFAULT_SPEED)
         self.declare_parameter("default_acc", DEFAULT_ACC)
@@ -42,6 +48,16 @@ class MoveToCharucoPoseNode(Node):
         self.xarm_service_name = self.get_parameter("xarm_service_name").value
         self.controller_name = self.get_parameter("controller_name").value
         self.joint_prefix = self.get_parameter("joint_prefix").value
+        self.joint_state_topic = self.get_parameter("joint_state_topic").value
+        self.joint_state_sync_timeout = float(
+            self.get_parameter("joint_state_sync_timeout").value
+        )
+        self.joint_state_tolerance = float(
+            self.get_parameter("joint_state_tolerance").value
+        )
+        self.publish_warmup_time = float(
+            self.get_parameter("publish_warmup_time").value
+        )
         self.input_unit = self.get_parameter("input_unit").value.lower()
         self.default_speed = float(self.get_parameter("default_speed").value)
         self.default_acc = float(self.get_parameter("default_acc").value)
@@ -52,8 +68,10 @@ class MoveToCharucoPoseNode(Node):
         self.default_timeout = float(self.get_parameter("default_timeout").value)
         self.default_radius = float(self.get_parameter("default_radius").value)
 
-        if self.backend not in ("auto", "xarm_api", "trajectory"):
-            raise ValueError("backend must be 'auto', 'xarm_api', or 'trajectory'")
+        if self.backend not in ("auto", "xarm_api", "trajectory", "topic"):
+            raise ValueError(
+                "backend must be 'auto', 'xarm_api', 'trajectory', or 'topic'"
+            )
         if self.input_unit not in ("deg", "rad"):
             raise ValueError("input_unit must be 'deg' or 'rad'")
 
@@ -73,6 +91,20 @@ class MoveToCharucoPoseNode(Node):
             self.trajectory_action_name,
             callback_group=self.callback_group,
         )
+        self.trajectory_publisher = self.create_publisher(
+            JointTrajectory,
+            self.trajectory_topic,
+            10,
+        )
+        self.latest_joint_state = None
+        self.latest_joint_state_event = threading.Event()
+        self.joint_state_subscription = self.create_subscription(
+            JointState,
+            self.joint_state_topic,
+            self.handle_joint_state,
+            10,
+            callback_group=self.callback_group,
+        )
         self.server = self.create_service(
             MoveJoint,
             self.server_service_name,
@@ -86,6 +118,7 @@ class MoveToCharucoPoseNode(Node):
         )
         self.get_logger().info(
             f"backend={self.backend}, xarm_service={self.xarm_service_name}, "
+            f"trajectory_topic={self.trajectory_topic}, "
             f"trajectory_action={self.trajectory_action_name}"
         )
         self.get_logger().info(
@@ -111,7 +144,7 @@ class MoveToCharucoPoseNode(Node):
         return sorted(matches)[0]
 
     def get_xarm_client(self):
-        if self.backend == "trajectory":
+        if self.backend in ("trajectory", "topic"):
             return None
 
         service_name = self.resolve_xarm_service_name()
@@ -131,6 +164,103 @@ class MoveToCharucoPoseNode(Node):
             self.get_logger().info(f"Forwarding commands to: {service_name}")
 
         return self.xarm_client
+
+    def handle_joint_state(self, msg):
+        self.latest_joint_state = msg
+        self.latest_joint_state_event.set()
+
+    def wait_for_joint_state_target(self, target_positions):
+        if self.joint_state_sync_timeout <= 0.0:
+            return True
+
+        deadline = self.get_clock().now() + Duration(
+            seconds=self.joint_state_sync_timeout
+        )
+        while self.get_clock().now() < deadline:
+            msg = self.latest_joint_state
+            if msg is not None:
+                positions = dict(zip(msg.name, msg.position))
+                if all(name in positions for name in self.joint_names):
+                    errors = [
+                        abs(positions[name] - target)
+                        for name, target in zip(self.joint_names, target_positions)
+                    ]
+                    if max(errors) <= self.joint_state_tolerance:
+                        return True
+
+            self.latest_joint_state_event.clear()
+            remaining = (deadline - self.get_clock().now()).nanoseconds / 1e9
+            self.latest_joint_state_event.wait(timeout=min(max(remaining, 0.0), 0.1))
+
+        return False
+
+    def get_current_joint_positions(self):
+        msg = self.latest_joint_state
+        if msg is None:
+            return None
+
+        positions = dict(zip(msg.name, msg.position))
+        if not all(name in positions for name in self.joint_names):
+            return None
+
+        return [positions[name] for name in self.joint_names]
+
+    def move_with_joint_trajectory_topic(
+        self, input_angles, target_positions, request, response
+    ):
+        move_duration = request.mvtime if request.mvtime > 0.0 else self.default_move_duration
+        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
+            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
+        current_positions = self.get_current_joint_positions()
+
+        trajectory = JointTrajectory()
+        trajectory.joint_names = self.joint_names
+
+        if current_positions is not None:
+            start_point = JointTrajectoryPoint()
+            start_point.positions = current_positions
+            start_point.time_from_start.sec = 0
+            start_point.time_from_start.nanosec = 0
+            trajectory.points.append(start_point)
+        else:
+            self.get_logger().warn(
+                f"No usable joint state on {self.joint_state_topic}; "
+                "publishing target-only trajectory"
+            )
+
+        target_point = JointTrajectoryPoint()
+        target_point.positions = target_positions
+        target_point.time_from_start.sec = int(move_duration)
+        target_point.time_from_start.nanosec = int(
+            (move_duration - int(move_duration)) * 1e9
+        )
+        trajectory.points.append(target_point)
+
+        self.get_logger().info(
+            "Publishing trajectory to "
+            f"{self.trajectory_topic}: angles_{self.input_unit}={input_angles}, "
+            f"duration={move_duration:.3f}s"
+        )
+
+        if self.publish_warmup_time > 0.0:
+            time.sleep(self.publish_warmup_time)
+
+        self.trajectory_publisher.publish(trajectory)
+
+        time.sleep(move_duration + 1.0)
+        response.ret = 0
+        response.message = "success"
+
+        if not self.wait_for_joint_state_target(target_positions):
+            response.message = (
+                "success, but /joint_states did not reach target before timeout; "
+                "RViz current state may still be stale"
+            )
+            self.get_logger().warn(response.message)
+            return response
+
+        self.get_logger().info("Trajectory published and /joint_states reached target")
+        return response
 
     def move_with_joint_trajectory(self, input_angles, target_positions, request, response):
         if self.backend == "xarm_api":
@@ -213,7 +343,15 @@ class MoveToCharucoPoseNode(Node):
             )
             return response
 
-        self.get_logger().info("Trajectory completed successfully")
+        if not self.wait_for_joint_state_target(target_positions):
+            response.message = (
+                "success, but /joint_states did not reach target before timeout; "
+                "RViz current state may still be stale"
+            )
+            self.get_logger().warn(response.message)
+            return response
+
+        self.get_logger().info("Trajectory completed and /joint_states reached target")
         return response
 
     @staticmethod
@@ -238,6 +376,14 @@ class MoveToCharucoPoseNode(Node):
             xarm_angles = input_angles
 
         xarm_client = self.get_xarm_client()
+        if self.backend == "topic":
+            return self.move_with_joint_trajectory_topic(
+                input_angles,
+                xarm_angles,
+                request,
+                response,
+            )
+
         if xarm_client is None:
             return self.move_with_joint_trajectory(
                 input_angles,
@@ -297,6 +443,14 @@ class MoveToCharucoPoseNode(Node):
                 "set_servo_angle failed: "
                 f"ret={xarm_response.ret}, message={xarm_response.message}"
             )
+            return response
+
+        if not self.wait_for_joint_state_target(xarm_angles):
+            response.message = (
+                "success, but /joint_states did not reach target before timeout; "
+                "RViz current state may still be stale"
+            )
+            self.get_logger().warn(response.message)
             return response
 
         self.get_logger().info("Target pose command succeeded")
