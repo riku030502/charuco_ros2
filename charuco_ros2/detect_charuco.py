@@ -9,8 +9,9 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from geometry_msgs.msg import TransformStamped
+from std_srvs.srv import Trigger
 
 from cv_bridge import CvBridge
 from tf2_ros import (
@@ -32,9 +33,13 @@ class CharucoDetectorNode(Node):
         # =========================
         # Parameters
         # =========================
-        self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
+        self.declare_parameter(
+            "image_topic",
+            "/camera/hand_camera/color/image_raw/compressed"
+        )
         self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
         self.declare_parameter("debug_image_topic", "/charuco/debug_image")
+        self.declare_parameter("detect_service_name", "/charuco/detect_once")
 
         self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
         self.declare_parameter("child_frame", "charuco_board")
@@ -63,6 +68,7 @@ class CharucoDetectorNode(Node):
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
+        self.detect_service_name = self.get_parameter("detect_service_name").value
 
         self.parent_frame = self.get_parameter("parent_frame").value
         self.child_frame = self.get_parameter("child_frame").value
@@ -152,6 +158,7 @@ class CharucoDetectorNode(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.camera_info_received = False
+        self.latest_image_msg = None
 
         # =========================
         # ROS
@@ -171,10 +178,16 @@ class CharucoDetectorNode(Node):
         )
 
         self.image_sub = self.create_subscription(
-            Image,
+            CompressedImage,
             self.image_topic,
             self.image_callback,
             10
+        )
+
+        self.detect_service = self.create_service(
+            Trigger,
+            self.detect_service_name,
+            self.detect_service_callback
         )
 
         self.debug_pub = self.create_publisher(
@@ -193,6 +206,7 @@ class CharucoDetectorNode(Node):
         self.get_logger().info("ChArUco detector node started")
         self.get_logger().info(f"image_topic: {self.image_topic}")
         self.get_logger().info(f"camera_info_topic: {self.camera_info_topic}")
+        self.get_logger().info(f"detect_service_name: {self.detect_service_name}")
         self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
         self.get_logger().info(f"square_length: {self.square_length} m")
         self.get_logger().info(f"marker_length: {self.marker_length} m")
@@ -224,24 +238,55 @@ class CharucoDetectorNode(Node):
         self.get_logger().info(f"camera_matrix:\n{self.camera_matrix}")
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
 
-    def image_callback(self, msg: Image):
+    def image_callback(self, msg: CompressedImage):
+        self.latest_image_msg = msg
+
+    def detect_service_callback(self, request, response):
+        del request
+
         if not self.camera_info_received:
-            self.get_logger().warn("Waiting for CameraInfo...", throttle_duration_sec=2.0)
+            self.get_logger().warn(
+                "Waiting for CameraInfo...",
+                throttle_duration_sec=2.0
+            )
             self.publish_saved_world_transforms(
-                msg.header.stamp,
+                None,
                 "waiting for CameraInfo"
             )
-            return
+            response.success = False
+            response.message = "waiting for CameraInfo"
+            return response
 
+        if self.latest_image_msg is None:
+            self.publish_saved_world_transforms(
+                None,
+                "no image has been received"
+            )
+            response.success = False
+            response.message = "no image has been received"
+            return response
+
+        success, message = self.detect_charuco(self.latest_image_msg)
+        response.success = success
+        response.message = message
+        return response
+
+    def detect_charuco(self, msg: CompressedImage):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame = self.bridge.compressed_imgmsg_to_cv2(
+                msg,
+                desired_encoding="bgr8"
+            )
         except Exception as e:
-            self.get_logger().error(f"cv_bridge error: {e}")
+            self.get_logger().error(f"cv_bridge compressed image error: {e}")
             self.publish_saved_world_transforms(
                 msg.header.stamp,
-                "cv_bridge conversion failed"
+                "cv_bridge compressed image conversion failed"
             )
-            return
+            return (
+                False,
+                f"cv_bridge compressed image conversion failed: {e}"
+            )
 
         debug_frame = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -271,7 +316,11 @@ class CharucoDetectorNode(Node):
                         debug_frame,
                         "detected markers did not match any configured marker ID range"
                     )
-                    return
+                    return (
+                        False,
+                        "detected markers did not match any configured marker "
+                        "ID range"
+                    )
 
                 selected_board = board_config["board"]
                 selected_detector = board_config["detector"]
@@ -292,7 +341,7 @@ class CharucoDetectorNode(Node):
                 debug_frame,
                 f"ChArUco detection skipped: {e}"
             )
-            return
+            return False, f"ChArUco detection skipped: {e}"
 
         if marker_ids is not None and len(marker_ids) > 0:
             cv2.aruco.drawDetectedMarkers(debug_frame, marker_corners, marker_ids)
@@ -303,7 +352,7 @@ class CharucoDetectorNode(Node):
                 debug_frame,
                 "not enough ChArUco corners"
             )
-            return
+            return False, "not enough ChArUco corners"
 
         cv2.aruco.drawDetectedCornersCharuco(
             debug_frame,
@@ -337,7 +386,7 @@ class CharucoDetectorNode(Node):
                 debug_frame,
                 f"ChArUco pose estimation skipped: {e}"
             )
-            return
+            return False, f"ChArUco pose estimation skipped: {e}"
 
         if not success:
             self.handle_detection_failure(
@@ -345,7 +394,7 @@ class CharucoDetectorNode(Node):
                 debug_frame,
                 "solvePnP failed"
             )
-            return
+            return False, "solvePnP failed"
 
         # 座標軸を描画
         cv2.drawFrameAxes(
@@ -372,6 +421,7 @@ class CharucoDetectorNode(Node):
         )
 
         self.publish_debug_image(debug_frame, msg.header)
+        return True, f"detected ChArUco assigned to {child_frame_id}"
 
     def create_charuco_board(self, marker_ids=None):
         if marker_ids is None:
@@ -421,7 +471,7 @@ class CharucoDetectorNode(Node):
 
         return config["child_frame"]
 
-    def publish_tf(self, image_msg: Image, rvec, tvec, child_frame_id,
+    def publish_tf(self, image_msg: CompressedImage, rvec, tvec, child_frame_id,
                    camera_link_frame_id=None):
         transform = TransformStamped()
 
@@ -494,7 +544,7 @@ class CharucoDetectorNode(Node):
 
         self.tf_broadcaster.sendTransform(transforms)
 
-    def create_world_camera_transform(self, image_msg: Image,
+    def create_world_camera_transform(self, image_msg: CompressedImage,
                                       parent_to_charuco: TransformStamped,
                                       camera_link_frame_id):
         try:
@@ -556,7 +606,8 @@ class CharucoDetectorNode(Node):
         ])
         return translation, rotation
 
-    def handle_detection_failure(self, image_msg: Image, debug_frame, reason):
+    def handle_detection_failure(self, image_msg: CompressedImage, debug_frame,
+                                 reason):
         self.publish_saved_world_transforms(image_msg.header.stamp, reason)
         self.publish_debug_image(debug_frame, image_msg.header)
 
