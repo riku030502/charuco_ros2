@@ -9,7 +9,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
 
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
 from std_srvs.srv import Trigger
 
@@ -33,10 +33,7 @@ class CharucoDetectorNode(Node):
         # =========================
         # Parameters
         # =========================
-        self.declare_parameter(
-            "image_topic",
-            "/camera/hand_camera/color/image_raw/compressed"
-        )
+        self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
         self.declare_parameter("debug_image_topic", "/charuco/debug_image")
         self.declare_parameter("detect_service_name", "/charuco/detect_once")
@@ -178,7 +175,7 @@ class CharucoDetectorNode(Node):
         )
 
         self.image_sub = self.create_subscription(
-            CompressedImage,
+            Image,
             self.image_topic,
             self.image_callback,
             10
@@ -238,7 +235,7 @@ class CharucoDetectorNode(Node):
         self.get_logger().info(f"camera_matrix:\n{self.camera_matrix}")
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
 
-    def image_callback(self, msg: CompressedImage):
+    def image_callback(self, msg: Image):
         self.latest_image_msg = msg
 
     def detect_service_callback(self, request, response):
@@ -271,22 +268,16 @@ class CharucoDetectorNode(Node):
         response.message = message
         return response
 
-    def detect_charuco(self, msg: CompressedImage):
+    def detect_charuco(self, msg: Image):
         try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(
-                msg,
-                desired_encoding="bgr8"
-            )
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
-            self.get_logger().error(f"cv_bridge compressed image error: {e}")
+            self.get_logger().error(f"cv_bridge error: {e}")
             self.publish_saved_world_transforms(
                 msg.header.stamp,
-                "cv_bridge compressed image conversion failed"
+                "cv_bridge conversion failed"
             )
-            return (
-                False,
-                f"cv_bridge compressed image conversion failed: {e}"
-            )
+            return False, f"cv_bridge conversion failed: {e}"
 
         debug_frame = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -471,7 +462,7 @@ class CharucoDetectorNode(Node):
 
         return config["child_frame"]
 
-    def publish_tf(self, image_msg: CompressedImage, rvec, tvec, child_frame_id,
+    def publish_tf(self, image_msg: Image, rvec, tvec, child_frame_id,
                    camera_link_frame_id=None):
         transform = TransformStamped()
 
@@ -544,7 +535,7 @@ class CharucoDetectorNode(Node):
 
         self.tf_broadcaster.sendTransform(transforms)
 
-    def create_world_camera_transform(self, image_msg: CompressedImage,
+    def create_world_camera_transform(self, image_msg: Image,
                                       parent_to_charuco: TransformStamped,
                                       camera_link_frame_id):
         try:
@@ -606,8 +597,7 @@ class CharucoDetectorNode(Node):
         ])
         return translation, rotation
 
-    def handle_detection_failure(self, image_msg: CompressedImage, debug_frame,
-                                 reason):
+    def handle_detection_failure(self, image_msg: Image, debug_frame, reason):
         self.publish_saved_world_transforms(image_msg.header.stamp, reason)
         self.publish_debug_image(debug_frame, image_msg.header)
 
