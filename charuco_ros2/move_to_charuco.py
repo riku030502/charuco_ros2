@@ -16,8 +16,8 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from xarm_msgs.srv import MoveJoint
 
 
-LEFT_JOINT_DEGREES = [-53.0, 55.0, -110.0, 0.0, -52.0, -8.0]
-RIGHT_JOINT_DEGREES = [53.0, 55.0, -110.0, 0.0, -62.0, -8.0]
+RIGHT_JOINT_DEGREES = [-53.0, 55.0, -110.0, 0.0, -52.0, -8.0]
+LEFT_JOINT_DEGREES = [53.0, 55.0, -110.0, 0.0, -62.0, -8.0]
 DEFAULT_JOINT_DEGREES = LEFT_JOINT_DEGREES
 DEFAULT_SPEED = 0.035  # 0.1x of the xArm README example 0.35 rad/s
 DEFAULT_ACC = 1.0  # 0.1x of the xArm README example 10 rad/s^2
@@ -126,9 +126,22 @@ class MoveToCharucoPoseNode(Node):
             self.handle_move_request,
             callback_group=self.callback_group,
         )
+        self.left_server = self.create_service(
+            MoveJoint,
+            self.server_service_name + "/left",
+            self.handle_left_move_request,
+            callback_group=self.callback_group,
+        )
+        self.right_server = self.create_service(
+            MoveJoint,
+            self.server_service_name + "/right",
+            self.handle_right_move_request,
+            callback_group=self.callback_group,
+        )
 
         self.get_logger().info(
-            f"Service ready: {self.server_service_name} "
+            f"Services ready: {self.server_service_name} | "
+            f"{self.server_service_name}/left | {self.server_service_name}/right "
             f"(angles unit: {self.input_unit})"
         )
         self.get_logger().info(
@@ -137,9 +150,8 @@ class MoveToCharucoPoseNode(Node):
             f"trajectory_action={self.trajectory_action_name}"
         )
         self.get_logger().info(
-            "Use angles in joint1..joint6 order. "
-            f"camera_side={self.camera_side}, "
-            f"default pose: {self.side_joint_degrees} deg"
+            f"left pose:  {self.left_joint_degrees} deg\n"
+            f"right pose: {self.right_joint_degrees} deg"
         )
 
     def resolve_xarm_service_name(self):
@@ -376,8 +388,17 @@ class MoveToCharucoPoseNode(Node):
         future.add_done_callback(lambda _: done_event.set())
         return done_event.wait(timeout=timeout)
 
+    def handle_left_move_request(self, request, response):
+        return self._handle_move_request(request, response, self.left_joint_degrees)
+
+    def handle_right_move_request(self, request, response):
+        return self._handle_move_request(request, response, self.right_joint_degrees)
+
     def handle_move_request(self, request, response):
-        input_angles = list(request.angles) if request.angles else self.side_joint_degrees
+        return self._handle_move_request(request, response, self.side_joint_degrees)
+
+    def _handle_move_request(self, request, response, default_angles):
+        input_angles = list(request.angles) if request.angles else default_angles
         if len(input_angles) != 6:
             response.ret = -1
             response.message = (
