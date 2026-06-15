@@ -16,7 +16,9 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from xarm_msgs.srv import MoveJoint
 
 
-DEFAULT_JOINT_DEGREES = [-44.0, 28.0, -64.0, 0.0, -62.0, -8.0]
+LEFT_JOINT_DEGREES = [-53.0, 55.0, -110.0, 0.0, -52.0, -8.0]
+RIGHT_JOINT_DEGREES = [53.0, 55.0, -110.0, 0.0, -62.0, -8.0]
+DEFAULT_JOINT_DEGREES = LEFT_JOINT_DEGREES
 DEFAULT_SPEED = 0.035  # 0.1x of the xArm README example 0.35 rad/s
 DEFAULT_ACC = 1.0  # 0.1x of the xArm README example 10 rad/s^2
 MOVE_JOINT_TYPE = "xarm_msgs/srv/MoveJoint"
@@ -42,6 +44,9 @@ class MoveToCharucoPoseNode(Node):
         self.declare_parameter("default_wait", True)
         self.declare_parameter("default_timeout", 60.0)
         self.declare_parameter("default_radius", -1.0)
+        self.declare_parameter("camera_side", "left")
+        self.declare_parameter("left_joint_degrees", LEFT_JOINT_DEGREES)
+        self.declare_parameter("right_joint_degrees", RIGHT_JOINT_DEGREES)
 
         self.server_service_name = self.get_parameter("server_service_name").value
         self.backend = self.get_parameter("backend").value.lower()
@@ -67,6 +72,16 @@ class MoveToCharucoPoseNode(Node):
         self.default_wait = bool(self.get_parameter("default_wait").value)
         self.default_timeout = float(self.get_parameter("default_timeout").value)
         self.default_radius = float(self.get_parameter("default_radius").value)
+        self.camera_side = self.get_parameter("camera_side").value.lower()
+        self.left_joint_degrees = list(self.get_parameter("left_joint_degrees").value)
+        self.right_joint_degrees = list(self.get_parameter("right_joint_degrees").value)
+
+        if self.camera_side == "left":
+            self.side_joint_degrees = self.left_joint_degrees
+        elif self.camera_side == "right":
+            self.side_joint_degrees = self.right_joint_degrees
+        else:
+            raise ValueError("camera_side must be 'left' or 'right'")
 
         if self.backend not in ("auto", "xarm_api", "trajectory", "topic"):
             raise ValueError(
@@ -123,7 +138,8 @@ class MoveToCharucoPoseNode(Node):
         )
         self.get_logger().info(
             "Use angles in joint1..joint6 order. "
-            f"Empty angles uses default pose: {DEFAULT_JOINT_DEGREES} deg"
+            f"camera_side={self.camera_side}, "
+            f"default pose: {self.side_joint_degrees} deg"
         )
 
     def resolve_xarm_service_name(self):
@@ -361,7 +377,7 @@ class MoveToCharucoPoseNode(Node):
         return done_event.wait(timeout=timeout)
 
     def handle_move_request(self, request, response):
-        input_angles = list(request.angles) if request.angles else DEFAULT_JOINT_DEGREES
+        input_angles = list(request.angles) if request.angles else self.side_joint_degrees
         if len(input_angles) != 6:
             response.ret = -1
             response.message = (
