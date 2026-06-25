@@ -3,7 +3,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 # =========================
@@ -18,8 +18,15 @@ marker_length_mm = 7   # マーカ部分 7 mm
 # 印刷解像度
 dpi = 300
 
-# 余白
-margin_mm = 10
+# =========================
+# Margin / colored border
+# =========================
+# ChArUco本体と色付き縁の間の白い余白
+# 今回は白余白なし
+white_margin_mm = 0
+
+# 色付き縁の太さ
+color_border_mm = 3
 
 # 出力先
 output_dir = Path("boards/generated")
@@ -28,16 +35,19 @@ output_dir = Path("boards/generated")
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 # detect_charuco.py の board_id_configs と対応させる
+# border_color_rgb は PIL 用なので RGB 指定
 board_configs = [
     {
         "name": "left_camera_charuco",
         "min_id": 0,
         "max_id": 16,
+        "border_color_rgb": (255, 0, 0),  # 赤
     },
     {
         "name": "right_camera_charuco",
         "min_id": 30,
         "max_id": 46,
+        "border_color_rgb": (0, 0, 255),  # 青
     },
 ]
 
@@ -66,28 +76,47 @@ def generate_board(config):
 
     board_width_px = mm_to_px(board_width_mm)
     board_height_px = mm_to_px(board_height_mm)
-    margin_px = mm_to_px(margin_mm)
 
-    image_width_px = board_width_px + 2 * margin_px
-    image_height_px = board_height_px + 2 * margin_px
+    white_margin_px = mm_to_px(white_margin_mm)
+    color_border_px = mm_to_px(color_border_mm)
 
-    img = board.generateImage(
-        (image_width_px, image_height_px),
-        marginSize=margin_px,
+    # ChArUco本体のみの画像サイズ
+    charuco_width_px = board_width_px + 2 * white_margin_px
+    charuco_height_px = board_height_px + 2 * white_margin_px
+
+    # ChArUco本体を生成
+    # white_margin_mm = 0 なので、marginSize=0 になる
+    charuco_img = board.generateImage(
+        (charuco_width_px, charuco_height_px),
+        marginSize=white_margin_px,
         borderBits=1
+    )
+
+    # OpenCV出力はグレースケールなので、PILのRGB画像に変換
+    pil_img = Image.fromarray(charuco_img).convert("RGB")
+
+    # PILで色付き縁を追加
+    pil_img = ImageOps.expand(
+        pil_img,
+        border=color_border_px,
+        fill=config["border_color_rgb"]
     )
 
     output_base = (
         f"{config['name']}_7x5_square10_marker7_"
-        f"id{config['min_id']}-{config['max_id']}_300dpi"
+        f"id{config['min_id']}-{config['max_id']}_"
+        f"margin{white_margin_mm}_border{color_border_mm}_300dpi"
     )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_png = output_dir / f"{output_base}.png"
     output_pdf = output_dir / f"{output_base}.pdf"
 
-    pil_img = Image.fromarray(img)
     pil_img.save(output_png, dpi=(dpi, dpi))
     pil_img.save(output_pdf, "PDF", resolution=dpi)
+
+    total_width_mm = board_width_mm + 2 * white_margin_mm + 2 * color_border_mm
+    total_height_mm = board_height_mm + 2 * white_margin_mm + 2 * color_border_mm
 
     print(f"Saved: {output_png}")
     print(f"Saved: {output_pdf}")
@@ -95,11 +124,16 @@ def generate_board(config):
     print(f"Marker IDs: {config['min_id']} - {config['max_id']}")
     print(f"Board size: {board_width_mm} mm x {board_height_mm} mm")
     print(
-        "Image size with margin: "
-        f"{board_width_mm + 2 * margin_mm} mm x "
-        f"{board_height_mm + 2 * margin_mm} mm"
+        "Image size with white margin: "
+        f"{board_width_mm + 2 * white_margin_mm} mm x "
+        f"{board_height_mm + 2 * white_margin_mm} mm"
     )
-    print(f"Pixel size: {image_width_px} px x {image_height_px} px")
+    print(
+        "Image size with color border: "
+        f"{total_width_mm} mm x {total_height_mm} mm"
+    )
+    print(f"Pixel size: {pil_img.width} px x {pil_img.height} px")
+    print(f"Border color RGB: {config['border_color_rgb']}")
     print("")
 
 

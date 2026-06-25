@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'aruco3 = charuco_ros2.5_7_aruco3:main',
+            'generate_charuco_5_7 = charuco_ros2.generate_charuco_5_7:main',
             'detect_charuco = charuco_ros2.detect_charuco:main',
             'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
             'detect_apriltag = charuco_ros2.detect_apriltag:main',
