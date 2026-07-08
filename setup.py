@@ -24,12 +24,13 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'aruco3 = charuco_ros2.5_7_aruco3:main',
+            'multi_cube_charuco_detector = charuco_ros2.multi_cube_charuco_detector:main',
             'generate_charuco_5_7 = charuco_ros2.generate_charuco_5_7:main',
             'detect_charuco = charuco_ros2.detect_charuco:main',
             'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
             'detect_apriltag = charuco_ros2.detect_apriltag:main',
             'move_to_charuco = charuco_ros2.move_to_charuco:main',
+            'find_cube = charuco_ros2.find_cube:main',
         ],
     },
 )

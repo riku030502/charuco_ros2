@@ -25,8 +25,8 @@ dpi = 300
 white_margin_mm = 0
 
 # 色付き縁の太さ
-# 今回は 2 mm
-color_border_mm = 2
+# 今回は 5 mm
+color_border_mm = 5
 
 # まとめ画像内で、各面の間に入れる余白
 face_gap_mm = 5

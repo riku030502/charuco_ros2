@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation as R
 
 class MultiCharucoDetectorNode(Node):
     def __init__(self):
-        super().__init__("multi_charuco_detector_node")
+        super().__init__("multi_cube_charuco_detector_node")
 
         # =========================
         # Parameters
@@ -35,6 +35,7 @@ class MultiCharucoDetectorNode(Node):
         self.declare_parameter("squares_y", 4)
         self.declare_parameter("square_length", 0.010)  # [m]
         self.declare_parameter("marker_length", 0.007)  # [m]
+        self.declare_parameter("cube_size", 0.050)  # [m] キューブ一辺の長さ
 
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
@@ -46,6 +47,7 @@ class MultiCharucoDetectorNode(Node):
         self.squares_y = self.get_parameter("squares_y").value
         self.square_length = self.get_parameter("square_length").value
         self.marker_length = self.get_parameter("marker_length").value
+        self.cube_size = self.get_parameter("cube_size").value
 
         # =========================
         # Board ID configs
@@ -73,6 +75,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 0,
                 "max_id": 7,
                 "child_frame": "left_cube_front_charuco",
+                "cube_frame": "left_cube",
             },
             {
                 "name": "left_cube_left_charuco",
@@ -81,6 +84,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 8,
                 "max_id": 15,
                 "child_frame": "left_cube_left_charuco",
+                "cube_frame": "left_cube",
             },
             {
                 "name": "left_cube_right_charuco",
@@ -89,6 +93,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 16,
                 "max_id": 23,
                 "child_frame": "left_cube_right_charuco",
+                "cube_frame": "left_cube",
             },
             {
                 "name": "left_cube_back_charuco",
@@ -97,6 +102,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 24,
                 "max_id": 31,
                 "child_frame": "left_cube_back_charuco",
+                "cube_frame": "left_cube",
             },
             {
                 "name": "left_cube_top_charuco",
@@ -105,6 +111,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 32,
                 "max_id": 39,
                 "child_frame": "left_cube_top_charuco",
+                "cube_frame": "left_cube",
             },
             {
                 "name": "right_cube_front_charuco",
@@ -113,6 +120,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 40,
                 "max_id": 47,
                 "child_frame": "right_cube_front_charuco",
+                "cube_frame": "right_cube",
             },
             {
                 "name": "right_cube_left_charuco",
@@ -121,6 +129,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 48,
                 "max_id": 55,
                 "child_frame": "right_cube_left_charuco",
+                "cube_frame": "right_cube",
             },
             {
                 "name": "right_cube_right_charuco",
@@ -129,6 +138,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 56,
                 "max_id": 63,
                 "child_frame": "right_cube_right_charuco",
+                "cube_frame": "right_cube",
             },
             {
                 "name": "right_cube_back_charuco",
@@ -137,6 +147,7 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 64,
                 "max_id": 71,
                 "child_frame": "right_cube_back_charuco",
+                "cube_frame": "right_cube",
             },
             {
                 "name": "right_cube_top_charuco",
@@ -145,8 +156,15 @@ class MultiCharucoDetectorNode(Node):
                 "min_id": 72,
                 "max_id": 79,
                 "child_frame": "right_cube_top_charuco",
+                "cube_frame": "right_cube",
             },
         ]
+
+        # 各面ボード座標系からfront面ボード座標系への変換行列を計算して追加
+        for config in self.board_id_configs:
+            config["T_front_in_face"] = self._compute_T_front_in_face(
+                config["face_name"], self.cube_size
+            )
 
         # =========================
         # ArUco dictionary
@@ -526,6 +544,13 @@ class MultiCharucoDetectorNode(Node):
             tvec=tvec,
         )
 
+        self.publish_cube_tf(
+            image_msg=image_msg,
+            config=config,
+            rvec=rvec,
+            tvec=tvec,
+        )
+
         self.draw_board_label(
             debug_frame=debug_frame,
             config=config,
@@ -641,6 +666,84 @@ class MultiCharucoDetectorNode(Node):
         transform.transform.rotation.w = float(quat[3])
 
         self.tf_broadcaster.sendTransform(transform)
+
+    @staticmethod
+    def _compute_T_front_in_face(face_name: str, L: float) -> np.ndarray:
+        """各面のボード座標系からfront面ボード座標系への4x4変換行列を返す。
+
+        キューブ座標系 (前面左上隅が原点):
+          +X: 右, +Y: 下, +Z: 奥（front面から離れる方向）
+
+        各面ボードの配置前提:
+          - 全面でボードの-Y軸（上方向）がキューブ上方向（-Y_cube）を向く
+            ただしtop面はボードの-Y軸がfront方向（-Z_cube）を向く
+          - ボード原点は各面をキューブ外から見た時の「左上コーナー」
+          - ボードZ軸はsolvePnP規約に従いカメラ方向（面の外側）を向く
+
+        面ごとの原点（キューブ座標）:
+          front: (0,  0,  0)
+          top:   (0,  0,  0)  ← front-left-top角を共有
+          right: (L,  0,  0)
+          left:  (0,  0,  L)
+          back:  (L,  0,  L)
+        """
+        # 各面のボード座標軸（キューブ座標系で表現）と原点
+        # R の列 = [X_board, Y_board, Z_board] in cube coords
+        face_params = {
+            "front": (
+                np.array([[1,  0,  0], [0,  1,  0], [0,  0,  1]], dtype=float),
+                np.array([0.0, 0.0, 0.0]),
+            ),
+            "top": (
+                np.array([[1,  0,  0], [0,  0,  1], [0, -1,  0]], dtype=float),
+                np.array([0.0, 0.0, 0.0]),
+            ),
+            "right": (
+                np.array([[0,  0, -1], [0,  1,  0], [1,  0,  0]], dtype=float),
+                np.array([L,  0.0, 0.0]),
+            ),
+            "left": (
+                np.array([[0,  0,  1], [0,  1,  0], [-1, 0,  0]], dtype=float),
+                np.array([0.0, 0.0, L]),
+            ),
+            "back": (
+                np.array([[-1, 0,  0], [0,  1,  0], [0,  0, -1]], dtype=float),
+                np.array([L,  0.0, L]),
+            ),
+        }
+
+        R_face_to_cube, p_face = face_params[face_name]
+        R_front_to_cube = np.eye(3)
+        p_front = np.zeros(3)
+
+        # front board frame → face board frame
+        R_front_in_face = R_face_to_cube.T @ R_front_to_cube
+        t_front_in_face = R_face_to_cube.T @ (p_front - p_face)
+
+        T = np.eye(4)
+        T[:3, :3] = R_front_in_face
+        T[:3,  3] = t_front_in_face
+        return T
+
+    def publish_cube_tf(self, image_msg: Image, config: dict, rvec, tvec):
+        """検出した面のボード姿勢からfront面相当のTFを計算して発信する。"""
+        R_face, _ = cv2.Rodrigues(rvec)
+        T_face_in_cam = np.eye(4)
+        T_face_in_cam[:3, :3] = R_face
+        T_face_in_cam[:3,  3] = tvec.flatten()
+
+        T_front_in_cam = T_face_in_cam @ config["T_front_in_face"]
+
+        R_front = T_front_in_cam[:3, :3]
+        t_front = T_front_in_cam[:3, 3].reshape(3, 1)
+        rvec_front, _ = cv2.Rodrigues(R_front)
+
+        self.publish_tf(
+            image_msg=image_msg,
+            child_frame=config["cube_frame"],
+            rvec=rvec_front,
+            tvec=t_front,
+        )
 
     def publish_debug_image(self, frame, header):
         try:
