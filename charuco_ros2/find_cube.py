@@ -24,11 +24,11 @@ class FindCubeNode(Node):
     def __init__(self):
         super().__init__("find_cube_node")
 
-        self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/camera/color/camera_info")
+        self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
         self.declare_parameter(
             "depth_image_topic",
-            "/camera/camera/aligned_depth_to_color/image_raw",
+            "/camera/hand_camera/aligned_depth_to_color/image_raw",
         )
         self.declare_parameter("debug_image_topic", "/find_cube/debug_image")
         self.declare_parameter("parent_frame", "")
