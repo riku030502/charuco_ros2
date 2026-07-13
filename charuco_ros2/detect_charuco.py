@@ -11,6 +11,7 @@ from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
+from std_srvs.srv import Trigger
 
 from cv_bridge import CvBridge
 from tf2_ros import (
@@ -26,109 +27,105 @@ from scipy.spatial.transform import Rotation as R
 
 
 class CharucoDetectorNode(Node):
+    PARAM_DEFAULTS = {
+        "image_topic": "/camera/hand_camera/color/image_raw",
+        "camera_info_topic": "/camera/hand_camera/color/camera_info",
+        "debug_image_topic": "/charuco/debug_image",
+        "detect_service_name": "/charuco/detect_once",
+        "parent_frame": "hand_camera_color_optical_frame",
+        "child_frame": "charuco_board",
+        "auto_assign_child_frame": True,
+        "publish_camera_link_tf": True,
+        "publish_world_camera_tf": True,
+        "world_frame": "world",
+        "world_lookup_timeout": 0.02,
+        "world_tf_cache_file": "charuco_ros2/config/world_camera_tfs.json",
+        "saved_world_tf_publish_rate": 10.0,
+        "camera_link_offset_x": 0.052,
+        "camera_link_offset_y": 0.067,
+        "camera_link_offset_z": 0.0,
+        "camera_link_rotation_z_deg": 90.0,
+        "camera_link_rotation_x_deg": 90.0,
+        "camera_link_rotation_y_deg": 180.0,
+        "squares_x": 7,
+        "squares_y": 5,
+        "square_length": 0.010,
+        "marker_length": 0.007,
+    }
+
+    BOARD_ID_CONFIGS = [
+        {
+            "name": "left_camera_charuco",
+            "min_id": 0,
+            "max_id": 16,
+            "child_frame": "left_camera_charuco",
+            "camera_link_frame": "left_camera_link",
+        },
+        {
+            "name": "right_camera_charuco",
+            "min_id": 30,
+            "max_id": 46,
+            "child_frame": "right_camera_charuco",
+            "camera_link_frame": "right_camera_link",
+        },
+    ]
+
     def __init__(self):
         super().__init__("charuco_detector_node")
 
-        # =========================
-        # Parameters
-        # =========================
-        self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
-        self.declare_parameter("debug_image_topic", "/charuco/debug_image")
+        for name, default in self.PARAM_DEFAULTS.items():
+            self.declare_parameter(name, default)
 
-        self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
-        self.declare_parameter("child_frame", "charuco_board")
-        self.declare_parameter("auto_assign_child_frame", True)
-        self.declare_parameter("publish_camera_link_tf", True)
-        self.declare_parameter("publish_world_camera_tf", True)
-        self.declare_parameter("world_frame", "world")
-        self.declare_parameter("world_lookup_timeout", 0.02)
-        self.declare_parameter(
-            "world_tf_cache_file",
-            "charuco_ros2/config/world_camera_tfs.json"
-        )
-        self.declare_parameter("saved_world_tf_publish_rate", 10.0)
-        self.declare_parameter("camera_link_offset_x", 0.052)  # [m]
-        self.declare_parameter("camera_link_offset_y", 0.067)  # [m]
-        self.declare_parameter("camera_link_offset_z", 0.0)    # [m]
-        self.declare_parameter("camera_link_rotation_z_deg", 90.0)
-        self.declare_parameter("camera_link_rotation_x_deg", 90.0)
-        self.declare_parameter("camera_link_rotation_y_deg", 180.0)
-
-        self.declare_parameter("squares_x", 7)
-        self.declare_parameter("squares_y", 5)
-        self.declare_parameter("square_length", 0.010)  # [m]
-        self.declare_parameter("marker_length", 0.007)  # [m]
-
-        self.image_topic = self.get_parameter("image_topic").value
-        self.camera_info_topic = self.get_parameter("camera_info_topic").value
-        self.debug_image_topic = self.get_parameter("debug_image_topic").value
-
-        self.parent_frame = self.get_parameter("parent_frame").value
-        self.child_frame = self.get_parameter("child_frame").value
-        self.auto_assign_child_frame = (
-            self.get_parameter("auto_assign_child_frame").value
-        )
-        self.publish_camera_link_tf = (
-            self.get_parameter("publish_camera_link_tf").value
-        )
-        self.publish_world_camera_tf = (
-            self.get_parameter("publish_world_camera_tf").value
-        )
-        self.world_frame = self.get_parameter("world_frame").value
-        self.world_lookup_timeout = float(
-            self.get_parameter("world_lookup_timeout").value
-        )
-        self.world_tf_cache_file = os.path.expanduser(
-            self.get_parameter("world_tf_cache_file").value
-        )
+        self.image_topic = self.param("image_topic")
+        self.camera_info_topic = self.param("camera_info_topic")
+        self.debug_image_topic = self.param("debug_image_topic")
+        self.detect_service_name = self.param("detect_service_name")
+        self.parent_frame = self.param("parent_frame")
+        self.child_frame = self.param("child_frame")
+        self.auto_assign_child_frame = self.param("auto_assign_child_frame")
+        self.publish_camera_link_tf = self.param("publish_camera_link_tf")
+        self.publish_world_camera_tf = self.param("publish_world_camera_tf")
+        self.world_frame = self.param("world_frame")
+        self.world_lookup_timeout = float(self.param("world_lookup_timeout"))
+        cache_file = self.param("world_tf_cache_file")
+        if not os.path.isabs(cache_file):
+            cache_file = os.path.join(
+                os.path.dirname(__file__), "..", "config", "world_camera_tfs.json"
+            )
+        self.world_tf_cache_file = os.path.realpath(os.path.expanduser(cache_file))
         self.saved_world_tf_publish_rate = float(
-            self.get_parameter("saved_world_tf_publish_rate").value
+            self.param("saved_world_tf_publish_rate")
         )
-        self.camera_link_offset = (
-            self.get_parameter("camera_link_offset_x").value,
-            self.get_parameter("camera_link_offset_y").value,
-            self.get_parameter("camera_link_offset_z").value,
+        self.camera_link_offset = self.params(
+            "camera_link_offset_x",
+            "camera_link_offset_y",
+            "camera_link_offset_z",
         )
         self.camera_link_quat = R.from_euler(
             "zxy",
-            [
-                self.get_parameter("camera_link_rotation_z_deg").value,
-                self.get_parameter("camera_link_rotation_x_deg").value,
-                self.get_parameter("camera_link_rotation_y_deg").value,
-            ],
+            self.params(
+                "camera_link_rotation_z_deg",
+                "camera_link_rotation_x_deg",
+                "camera_link_rotation_y_deg",
+            ),
             degrees=True
         ).as_quat()
-        self.squares_x = self.get_parameter("squares_x").value
-        self.squares_y = self.get_parameter("squares_y").value
-        self.square_length = self.get_parameter("square_length").value
-        self.marker_length = self.get_parameter("marker_length").value
+        self.squares_x = self.param("squares_x")
+        self.squares_y = self.param("squares_y")
+        self.square_length = self.param("square_length")
+        self.marker_length = self.param("marker_length")
+        self.board_id_configs = [dict(config) for config in self.BOARD_ID_CONFIGS]
 
-        self.board_id_configs = [
-            {
-                "name": "left_camera_charuco",
-                "min_id": 0,
-                "max_id": 16,
-                "child_frame": "left_camera_charuco",
-                "camera_link_frame": "left_camera_link",
-            },
-            {
-                "name": "right_camera_charuco",
-                "min_id": 30,
-                "max_id": 46,
-                "child_frame": "right_camera_charuco",
-                "camera_link_frame": "right_camera_link",
-            },
-        ]
-
-        # =========================
-        # ChArUco board
-        # =========================
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(
             cv2.aruco.DICT_4X4_50
         )
 
         self.detector_params = cv2.aruco.DetectorParameters()
+        self.detector_params.useAruco3Detection = False
+        self.detector_params.minSideLengthCanonicalImg = 16
+        self.detector_params.adaptiveThreshWinSizeMin = 3
+        self.detector_params.adaptiveThreshWinSizeMax = 23
+        self.detector_params.adaptiveThreshWinSizeStep = 4
         self.aruco_detector = cv2.aruco.ArucoDetector(
             self.aruco_dict,
             self.detector_params
@@ -146,16 +143,11 @@ class CharucoDetectorNode(Node):
             config["board"] = self.create_charuco_board(marker_ids)
             config["detector"] = self.create_charuco_detector(config["board"])
 
-        # =========================
-        # Camera parameters
-        # =========================
         self.camera_matrix = None
         self.dist_coeffs = None
         self.camera_info_received = False
+        self.latest_image_msg = None
 
-        # =========================
-        # ROS
-        # =========================
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
         self.tf_buffer = Buffer()
@@ -177,6 +169,12 @@ class CharucoDetectorNode(Node):
             10
         )
 
+        self.detect_service = self.create_service(
+            Trigger,
+            self.detect_service_name,
+            self.detect_service_callback
+        )
+
         self.debug_pub = self.create_publisher(
             Image,
             self.debug_image_topic,
@@ -190,22 +188,29 @@ class CharucoDetectorNode(Node):
                 self.publish_saved_world_transforms
             )
 
-        self.get_logger().info("ChArUco detector node started")
-        self.get_logger().info(f"image_topic: {self.image_topic}")
-        self.get_logger().info(f"camera_info_topic: {self.camera_info_topic}")
-        self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
-        self.get_logger().info(f"square_length: {self.square_length} m")
-        self.get_logger().info(f"marker_length: {self.marker_length} m")
-        self.get_logger().info(
-            f"auto_assign_child_frame: {self.auto_assign_child_frame}"
-        )
-        self.get_logger().info(
+        self.log_startup()
+
+    def param(self, name):
+        return self.get_parameter(name).value
+
+    def params(self, *names):
+        return tuple(self.param(name) for name in names)
+
+    def log_startup(self):
+        for message in (
+            "ChArUco detector node started",
+            f"image_topic: {self.image_topic}",
+            f"camera_info_topic: {self.camera_info_topic}",
+            f"detect_service_name: {self.detect_service_name}",
+            f"board: {self.squares_x}x{self.squares_y}",
+            f"square_length: {self.square_length} m",
+            f"marker_length: {self.marker_length} m",
+            f"auto_assign_child_frame: {self.auto_assign_child_frame}",
             f"publish_world_camera_tf: {self.publish_world_camera_tf}, "
-            f"world_frame: {self.world_frame}"
-        )
-        self.get_logger().info(
-            f"world_tf_cache_file: {self.world_tf_cache_file}"
-        )
+            f"world_frame: {self.world_frame}",
+            f"world_tf_cache_file: {self.world_tf_cache_file}",
+        ):
+            self.get_logger().info(message)
 
     def camera_info_callback(self, msg: CameraInfo):
         if self.camera_info_received:
@@ -214,9 +219,10 @@ class CharucoDetectorNode(Node):
         self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
         self.dist_coeffs = np.array(msg.d, dtype=np.float64)
 
-        self.set_camera_parameters_for_detector(self.charuco_detector)
-        for config in self.board_id_configs:
-            self.set_camera_parameters_for_detector(config["detector"])
+        detectors = [self.charuco_detector]
+        detectors.extend(config["detector"] for config in self.board_id_configs)
+        for detector in detectors:
+            self.set_camera_parameters_for_detector(detector)
 
         self.camera_info_received = True
 
@@ -225,14 +231,40 @@ class CharucoDetectorNode(Node):
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
 
     def image_callback(self, msg: Image):
-        if not self.camera_info_received:
-            self.get_logger().warn("Waiting for CameraInfo...", throttle_duration_sec=2.0)
-            self.publish_saved_world_transforms(
-                msg.header.stamp,
-                "waiting for CameraInfo"
-            )
-            return
+        self.latest_image_msg = msg
 
+    def detect_service_callback(self, request, response):
+        del request
+
+        if not self.camera_info_received:
+            self.get_logger().warn(
+                "Waiting for CameraInfo...",
+                throttle_duration_sec=2.0
+            )
+            self.publish_saved_world_transforms(None, "waiting for CameraInfo")
+            return self.set_detect_response(response, False, "waiting for CameraInfo")
+
+        if self.latest_image_msg is None:
+            self.publish_saved_world_transforms(None, "no image has been received")
+            return self.set_detect_response(
+                response,
+                False,
+                "no image has been received"
+            )
+
+        success, message = self.detect_charuco(self.latest_image_msg)
+        return self.set_detect_response(response, success, message)
+
+    def set_detect_response(self, response, success, detail):
+        response.success = success
+        response.message = "success" if success else f"false: {detail}"
+        return response
+
+    def fail_detection(self, msg, debug_frame, reason):
+        self.handle_detection_failure(msg, debug_frame, reason)
+        return False, reason
+
+    def detect_charuco(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
@@ -241,69 +273,40 @@ class CharucoDetectorNode(Node):
                 msg.header.stamp,
                 "cv_bridge conversion failed"
             )
-            return
+            return False, f"cv_bridge conversion failed: {e}"
 
         debug_frame = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # =========================
-        # Detect ArUco markers and interpolate ChArUco corners
-        # =========================
         try:
-            if self.auto_assign_child_frame:
-                marker_corners, marker_ids, _ = (
-                    self.aruco_detector.detectMarkers(gray)
+            selected_board, selected_detector, child_frame_id, camera_link_frame_id = (
+                self.select_board(gray, debug_frame)
+            )
+            if selected_board is None:
+                return self.fail_detection(
+                    msg,
+                    debug_frame,
+                    "no markers detected or marker IDs did not match any configured range"
                 )
-
-                if marker_ids is not None and len(marker_ids) > 0:
-                    cv2.aruco.drawDetectedMarkers(
-                        debug_frame,
-                        marker_corners,
-                        marker_ids
-                    )
-
-                board_config = self.resolve_board_config_from_marker_ids(
-                    marker_ids
-                )
-                if board_config is None:
-                    self.handle_detection_failure(
-                        msg,
-                        debug_frame,
-                        "detected markers did not match any configured marker ID range"
-                    )
-                    return
-
-                selected_board = board_config["board"]
-                selected_detector = board_config["detector"]
-                child_frame_id = board_config["child_frame"]
-                camera_link_frame_id = board_config["camera_link_frame"]
-            else:
-                selected_board = self.board
-                selected_detector = self.charuco_detector
-                child_frame_id = self.child_frame
-                camera_link_frame_id = None
 
             charuco_corners, charuco_ids, marker_corners, marker_ids = (
                 selected_detector.detectBoard(gray)
             )
         except cv2.error as e:
-            self.handle_detection_failure(
+            return self.fail_detection(
                 msg,
                 debug_frame,
                 f"ChArUco detection skipped: {e}"
             )
-            return
 
-        if marker_ids is not None and len(marker_ids) > 0:
-            cv2.aruco.drawDetectedMarkers(debug_frame, marker_corners, marker_ids)
+        self.draw_markers(debug_frame, marker_corners, marker_ids)
 
         if charuco_ids is None or len(charuco_ids) < 6:
-            self.handle_detection_failure(
+            return self.fail_detection(
                 msg,
                 debug_frame,
                 "not enough ChArUco corners"
             )
-            return
 
         cv2.aruco.drawDetectedCornersCharuco(
             debug_frame,
@@ -316,9 +319,6 @@ class CharucoDetectorNode(Node):
             throttle_duration_sec=1.0
         )
 
-        # =========================
-        # Estimate pose
-        # =========================
         object_points = selected_board.getChessboardCorners()[
             charuco_ids.flatten()
         ].astype(np.float32)
@@ -332,20 +332,14 @@ class CharucoDetectorNode(Node):
                 self.dist_coeffs
             )
         except cv2.error as e:
-            self.handle_detection_failure(
+            return self.fail_detection(
                 msg,
                 debug_frame,
                 f"ChArUco pose estimation skipped: {e}"
             )
-            return
 
         if not success:
-            self.handle_detection_failure(
-                msg,
-                debug_frame,
-                "solvePnP failed"
-            )
-            return
+            return self.fail_detection(msg, debug_frame, "solvePnP failed")
 
         # 座標軸を描画
         cv2.drawFrameAxes(
@@ -372,23 +366,52 @@ class CharucoDetectorNode(Node):
         )
 
         self.publish_debug_image(debug_frame, msg.header)
+        return True, f"detected ChArUco assigned to {child_frame_id}"
+
+    def select_board(self, gray, debug_frame):
+        if not self.auto_assign_child_frame:
+            return self.board, self.charuco_detector, self.child_frame, None
+
+        marker_corners, marker_ids, _ = self.aruco_detector.detectMarkers(gray)
+        self.draw_markers(debug_frame, marker_corners, marker_ids)
+
+        if marker_ids is None or len(marker_ids) == 0:
+            self.get_logger().warn(
+                "No ArUco markers detected in the image",
+                throttle_duration_sec=2.0,
+            )
+            return None, None, None, None
+
+        self.get_logger().info(
+            f"Detected marker IDs: {sorted(marker_ids.flatten().tolist())}",
+            throttle_duration_sec=2.0,
+        )
+
+        config = self.resolve_board_config_from_marker_ids(marker_ids)
+        if config is None:
+            return None, None, None, None
+
+        return (
+            config["board"],
+            config["detector"],
+            config["child_frame"],
+            config["camera_link_frame"],
+        )
+
+    def draw_markers(self, frame, marker_corners, marker_ids):
+        if marker_ids is not None and len(marker_ids) > 0:
+            cv2.aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
 
     def create_charuco_board(self, marker_ids=None):
-        if marker_ids is None:
-            return cv2.aruco.CharucoBoard(
-                (self.squares_x, self.squares_y),
-                self.square_length,
-                self.marker_length,
-                self.aruco_dict
-            )
-
-        return cv2.aruco.CharucoBoard(
+        args = [
             (self.squares_x, self.squares_y),
             self.square_length,
             self.marker_length,
             self.aruco_dict,
-            marker_ids
-        )
+        ]
+        if marker_ids is not None:
+            args.append(marker_ids)
+        return cv2.aruco.CharucoBoard(*args)
 
     def create_charuco_detector(self, board):
         detector = cv2.aruco.CharucoDetector(board)
@@ -414,38 +437,38 @@ class CharucoDetectorNode(Node):
 
         return None
 
-    def resolve_child_frame_from_marker_ids(self, marker_ids):
-        config = self.resolve_board_config_from_marker_ids(marker_ids)
-        if config is None:
-            return None
-
-        return config["child_frame"]
-
-    def publish_tf(self, image_msg: Image, rvec, tvec, child_frame_id,
-                   camera_link_frame_id=None):
+    def create_transform(self, stamp, parent_frame, child_frame, translation, quat):
         transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = parent_frame
+        transform.child_frame_id = child_frame
+        self.set_translation(transform, translation)
+        self.set_rotation(transform, quat)
+        return transform
 
-        transform.header.stamp = image_msg.header.stamp
+    def set_translation(self, transform, translation):
+        transform.transform.translation.x = float(translation[0])
+        transform.transform.translation.y = float(translation[1])
+        transform.transform.translation.z = float(translation[2])
 
-        # 基本はCameraInfo/Imageのframe_idを使う方が安全
-        if image_msg.header.frame_id:
-            transform.header.frame_id = image_msg.header.frame_id
-        else:
-            transform.header.frame_id = self.parent_frame
-
-        transform.child_frame_id = child_frame_id
-
-        transform.transform.translation.x = float(tvec[0][0])
-        transform.transform.translation.y = float(tvec[1][0])
-        transform.transform.translation.z = float(tvec[2][0])
-
-        rot_mat, _ = cv2.Rodrigues(rvec)
-        quat = R.from_matrix(rot_mat).as_quat()  # x, y, z, w
-
+    def set_rotation(self, transform, quat):
         transform.transform.rotation.x = float(quat[0])
         transform.transform.rotation.y = float(quat[1])
         transform.transform.rotation.z = float(quat[2])
         transform.transform.rotation.w = float(quat[3])
+
+    def publish_tf(self, image_msg: Image, rvec, tvec, child_frame_id,
+                   camera_link_frame_id=None):
+        rot_mat, _ = cv2.Rodrigues(rvec)
+        quat = R.from_matrix(rot_mat).as_quat()  # x, y, z, w
+        parent_frame = image_msg.header.frame_id or self.parent_frame
+        transform = self.create_transform(
+            image_msg.header.stamp,
+            parent_frame,
+            child_frame_id,
+            tvec.flatten(),
+            quat,
+        )
 
         transforms = [transform]
 
@@ -454,33 +477,15 @@ class CharucoDetectorNode(Node):
             and camera_link_frame_id
             and not self.publish_world_camera_tf
         ):
-            camera_link_transform = TransformStamped()
-            camera_link_transform.header.stamp = image_msg.header.stamp
-            camera_link_transform.header.frame_id = child_frame_id
-            camera_link_transform.child_frame_id = camera_link_frame_id
-
-            camera_link_transform.transform.translation.x = float(
-                self.camera_link_offset[0]
+            transforms.append(
+                self.create_transform(
+                    image_msg.header.stamp,
+                    child_frame_id,
+                    camera_link_frame_id,
+                    self.camera_link_offset,
+                    self.camera_link_quat,
+                )
             )
-            camera_link_transform.transform.translation.y = float(
-                self.camera_link_offset[1]
-            )
-            camera_link_transform.transform.translation.z = float(
-                self.camera_link_offset[2]
-            )
-            camera_link_transform.transform.rotation.x = float(
-                self.camera_link_quat[0]
-            )
-            camera_link_transform.transform.rotation.y = float(
-                self.camera_link_quat[1]
-            )
-            camera_link_transform.transform.rotation.z = float(
-                self.camera_link_quat[2]
-            )
-            camera_link_transform.transform.rotation.w = float(
-                self.camera_link_quat[3]
-            )
-            transforms.append(camera_link_transform)
 
         if self.publish_world_camera_tf and camera_link_frame_id:
             world_camera_transform = self.create_world_camera_transform(
@@ -527,20 +532,13 @@ class CharucoDetectorNode(Node):
         )
         world_r_camera = world_r_charuco * charuco_r_camera
 
-        transform = TransformStamped()
-        transform.header.stamp = image_msg.header.stamp
-        transform.header.frame_id = self.world_frame
-        transform.child_frame_id = camera_link_frame_id
-        transform.transform.translation.x = float(world_t_camera[0])
-        transform.transform.translation.y = float(world_t_camera[1])
-        transform.transform.translation.z = float(world_t_camera[2])
-
-        quat = world_r_camera.as_quat()
-        transform.transform.rotation.x = float(quat[0])
-        transform.transform.rotation.y = float(quat[1])
-        transform.transform.rotation.z = float(quat[2])
-        transform.transform.rotation.w = float(quat[3])
-        return transform
+        return self.create_transform(
+            image_msg.header.stamp,
+            self.world_frame,
+            camera_link_frame_id,
+            world_t_camera,
+            world_r_camera.as_quat(),
+        )
 
     def transform_to_pose(self, transform: TransformStamped):
         translation = np.array([
@@ -694,35 +692,30 @@ class CharucoDetectorNode(Node):
     def transform_to_cache(self, transform: TransformStamped):
         return {
             "parent_frame": transform.header.frame_id,
-            "translation": {
-                "x": transform.transform.translation.x,
-                "y": transform.transform.translation.y,
-                "z": transform.transform.translation.z,
-            },
-            "rotation": {
-                "x": transform.transform.rotation.x,
-                "y": transform.transform.rotation.y,
-                "z": transform.transform.rotation.z,
-                "w": transform.transform.rotation.w,
-            },
+            "translation": self.xyz_to_dict(transform.transform.translation),
+            "rotation": self.xyzw_to_dict(transform.transform.rotation),
         }
 
     def transform_from_cache(self, child_frame_id, value):
-        transform = TransformStamped()
-        transform.header.frame_id = value.get("parent_frame", self.world_frame)
-        transform.child_frame_id = child_frame_id
+        return self.create_transform(
+            self.get_clock().now().to_msg(),
+            value.get("parent_frame", self.world_frame),
+            child_frame_id,
+            self.xyz_from_dict(value["translation"]),
+            self.xyzw_from_dict(value["rotation"]),
+        )
 
-        translation = value["translation"]
-        transform.transform.translation.x = float(translation["x"])
-        transform.transform.translation.y = float(translation["y"])
-        transform.transform.translation.z = float(translation["z"])
+    def xyz_to_dict(self, value):
+        return {"x": value.x, "y": value.y, "z": value.z}
 
-        rotation = value["rotation"]
-        transform.transform.rotation.x = float(rotation["x"])
-        transform.transform.rotation.y = float(rotation["y"])
-        transform.transform.rotation.z = float(rotation["z"])
-        transform.transform.rotation.w = float(rotation["w"])
-        return transform
+    def xyzw_to_dict(self, value):
+        return {"x": value.x, "y": value.y, "z": value.z, "w": value.w}
+
+    def xyz_from_dict(self, value):
+        return [float(value[key]) for key in ("x", "y", "z")]
+
+    def xyzw_from_dict(self, value):
+        return [float(value[key]) for key in ("x", "y", "z", "w")]
 
     def publish_debug_image(self, frame, header):
         try:

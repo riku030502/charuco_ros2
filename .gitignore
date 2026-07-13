@@ -1,0 +1,7 @@
+*.png
+*.pyc
+*.pdf
+__pycache__/
+
+# move_to_charucoが実行のたびに上書きする生成キャッシュ
+config/cube_target_poses.yaml

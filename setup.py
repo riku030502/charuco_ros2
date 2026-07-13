@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'charuco_ros2'
@@ -10,6 +13,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,9 +28,14 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'charuco_detector = charuco_ros2.detect_charuco:main',
-            'charuco_detector_9_7 = charuco_ros2.detect_charuco_9_7:main',
-            'apriltag_detector = charuco_ros2.detect_apriltag:main',
+            'multi_cube_charuco_detector = charuco_ros2.multi_cube_charuco_detector:main',
+            'generate_charuco_5_7 = charuco_ros2.generate_charuco_5_7:main',
+            'detect_charuco = charuco_ros2.detect_charuco:main',
+            'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
+            'detect_apriltag = charuco_ros2.detect_apriltag:main',
+            'move_to_charuco = charuco_ros2.move_to_charuco:main',
+            'sweep_cube_targets = charuco_ros2.sweep_cube_targets:main',
+            'find_cube = charuco_ros2.find_cube:main',
         ],
     },
 )
