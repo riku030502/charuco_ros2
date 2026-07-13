@@ -179,14 +179,17 @@ class MultiCharucoDetectorNode(Node):
         # =========================
         self.detector_params = cv2.aruco.DetectorParameters()
 
+        # Aruco3は縮小画像で検出するため、marker 1辺が
+        # minSideLengthCanonicalImg (default 32px) 未満だと足切りされる。
+        # 10mmマスのキューブ面は近接時でも1辺10px程度しかないので無効化する。
         if hasattr(self.detector_params, "useAruco3Detection"):
-            self.detector_params.useAruco3Detection = True
-            self.get_logger().info("Aruco3 detection: enabled")
-        else:
-            self.get_logger().warn(
-                "Aruco3 detection parameter is not available in this OpenCV version"
-            )
+            self.detector_params.useAruco3Detection = False
+            self.get_logger().info("Aruco3 detection: disabled (small markers)")
 
+        self.detector_params.minSideLengthCanonicalImg = 16
+        self.detector_params.adaptiveThreshWinSizeMin = 3
+        self.detector_params.adaptiveThreshWinSizeMax = 23
+        self.detector_params.adaptiveThreshWinSizeStep = 4
         self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
         # debug用に全marker数を見るためのArucoDetector

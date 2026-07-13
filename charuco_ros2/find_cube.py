@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import os
+
 import cv2
 import numpy as np
+import yaml
 
 import rclpy
 from rclpy.duration import Duration
@@ -36,10 +39,22 @@ class FindCubeNode(Node):
         self.declare_parameter("left_child_frame", "left_cube_color_frame")
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("publish_base_tf", True)
-        self.declare_parameter("base_frame", "world")
-        self.declare_parameter("base_right_child_frame", "right_cube_color_base_frame")
-        self.declare_parameter("base_left_child_frame", "left_cube_color_base_frame")
+        self.declare_parameter("base_frame", "link_base")
+        self.declare_parameter(
+            "base_right_child_frame",
+            "right_cube_color_link_base_frame",
+        )
+        self.declare_parameter(
+            "base_left_child_frame",
+            "left_cube_color_link_base_frame",
+        )
         self.declare_parameter("base_lookup_timeout", 0.02)
+        self.declare_parameter("save_detected_pose", True)
+        self.declare_parameter(
+            "cube_pose_cache_file",
+            "charuco_ros2/config/cube_target_poses.yaml",
+        )
+        self.declare_parameter("pose_save_interval_sec", 0.5)
         self.declare_parameter("use_depth_distance", True)
         self.declare_parameter("fallback_to_size_distance", True)
         self.declare_parameter("depth_sample_radius", 3)
@@ -52,10 +67,12 @@ class FindCubeNode(Node):
 
         # 輪郭検出後のフィルタ条件。
         # 小さいノイズ、細長い領域、正方形から外れた領域をここで落とす。
-        self.declare_parameter("min_contour_area", 1500.0)
-        self.declare_parameter("min_rectangularity", 0.45)
+        self.declare_parameter("min_contour_area", 50.0)
+        self.declare_parameter("max_contour_area", 80000.0)
+        self.declare_parameter("min_rectangularity", 0.15)
         self.declare_parameter("square_aspect_tolerance", 0.25)
-        self.declare_parameter("polygon_epsilon_ratio", 0.04)
+        self.declare_parameter("max_frame_aspect_ratio", 2.8)
+        self.declare_parameter("polygon_epsilon_ratio", 0.05)
         self.declare_parameter("log_interval_sec", 1.0)
 
         self.image_topic = self.get_parameter("image_topic").value
@@ -75,6 +92,15 @@ class FindCubeNode(Node):
             "base_left_child_frame"
         ).value
         self.base_lookup_timeout = self.get_parameter("base_lookup_timeout").value
+        self.save_detected_pose = bool(
+            self.get_parameter("save_detected_pose").value
+        )
+        self.cube_pose_cache_file = self.resolve_cache_file(
+            self.get_parameter("cube_pose_cache_file").value
+        )
+        self.pose_save_interval_sec = float(
+            self.get_parameter("pose_save_interval_sec").value
+        )
         self.use_depth_distance = self.get_parameter("use_depth_distance").value
         self.fallback_to_size_distance = self.get_parameter(
             "fallback_to_size_distance"
@@ -85,9 +111,13 @@ class FindCubeNode(Node):
         self.max_depth_m = self.get_parameter("max_depth_m").value
         self.frame_size_m = self.get_parameter("frame_size_m").value
         self.min_contour_area = self.get_parameter("min_contour_area").value
+        self.max_contour_area = self.get_parameter("max_contour_area").value
         self.min_rectangularity = self.get_parameter("min_rectangularity").value
         self.square_aspect_tolerance = self.get_parameter(
             "square_aspect_tolerance"
+        ).value
+        self.max_frame_aspect_ratio = self.get_parameter(
+            "max_frame_aspect_ratio"
         ).value
         self.polygon_epsilon_ratio = self.get_parameter(
             "polygon_epsilon_ratio"
@@ -106,8 +136,12 @@ class FindCubeNode(Node):
         self.cy = None
         self.latest_depth_image = None
 
-        # 赤・青それぞれで最後にログを出した時刻を保持し、ログ出力を間引く。
+        # 左右それぞれで最後にログを出した時刻を保持し、ログ出力を間引く。
         self.last_log_time = {
+            "right": None,
+            "left": None,
+        }
+        self.last_pose_save_time = {
             "right": None,
             "left": None,
         }
@@ -160,7 +194,21 @@ class FindCubeNode(Node):
         self.get_logger().info(
             f"base_left_child_frame: {self.base_left_child_frame}"
         )
+        self.get_logger().info(f"save_detected_pose: {self.save_detected_pose}")
+        self.get_logger().info(f"cube_pose_cache_file: {self.cube_pose_cache_file}")
         self.get_logger().info(f"frame_size_m: {self.frame_size_m}")
+
+    def resolve_cache_file(self, cache_file):
+        if os.path.isabs(cache_file):
+            return os.path.realpath(os.path.expanduser(cache_file))
+
+        package_relative_prefix = "charuco_ros2/"
+        if cache_file.startswith(package_relative_prefix):
+            cache_file = cache_file[len(package_relative_prefix):]
+
+        return os.path.realpath(
+            os.path.join(os.path.dirname(__file__), "..", cache_file)
+        )
 
     def camera_info_callback(self, msg: CameraInfo):
         # カメラ内部パラメータ行列 K の (0, 0) が x方向の焦点距離 fx。
@@ -191,81 +239,100 @@ class FindCubeNode(Node):
             return
 
         # BGRのまま色をしきい値処理すると明るさの影響を受けやすい。
-        # HSVに変換して、色相(H)を中心に赤枠・青枠の領域を取り出す。
+        # HSVに変換して、色相(H)を中心にマゼンタ枠の領域を取り出す。
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # 赤はH=0付近とH=180付近にまたがるため専用関数でマスクを作る。
-        red_mask = self.make_red_mask(hsv)
-        # 青はHSVのH=95〜130付近を対象にする。
-        # SとVの下限を設けて、白っぽい領域や暗いノイズを拾いにくくする。
-        blue_mask = cv2.inRange(
-            hsv,
-            np.array([95, 80, 50], dtype=np.uint8),
-            np.array([130, 255, 255], dtype=np.uint8),
-        )
+        magenta_mask = self.make_magenta_mask(hsv)
 
         # マスク画像から「正方形フレームらしい」候補だけを抽出する。
-        # 赤は右、青は左として扱い、それぞれ同じ手順で検出する。
-        red_detections = self.find_frames(red_mask)
-        blue_detections = self.find_frames(blue_mask)
+        # 両方ともマゼンタなので、色ではなく画像内の左右位置で分類する。
+        magenta_detections = self.find_frames(magenta_mask)
         # CameraInfo から fx が取得できていれば、各候補に distance_m を追加する。
-        self.add_distances(red_detections)
-        self.add_distances(blue_detections)
+        self.add_distances(magenta_detections)
+        left_detections, right_detections = self.split_detections_by_image_side(
+            magenta_detections,
+            frame.shape[1],
+        )
 
-        if red_detections:
-            self.log_detection("right", "赤い枠を検出: 右", red_detections)
+        if right_detections:
+            self.log_detection(
+                "right",
+                "色枠を検出しました",
+                right_detections,
+            )
             self.publish_detection_tf(
                 "right",
                 self.right_child_frame,
                 self.base_right_child_frame,
-                red_detections,
+                right_detections,
                 msg.header,
             )
 
-        if blue_detections:
-            self.log_detection("left", "青い枠を検出: 左", blue_detections)
+        if left_detections:
+            self.log_detection(
+                "left",
+                "色枠を検出しました",
+                left_detections,
+            )
             self.publish_detection_tf(
                 "left",
                 self.left_child_frame,
                 self.base_left_child_frame,
-                blue_detections,
+                left_detections,
                 msg.header,
             )
 
         # デバッグ画像には、元の輪郭・近似した四角形・外接矩形・距離を重ねて描画する。
+        # さらにマゼンタマスクを半透明で重ねてマスク段階の問題を視覚確認できるようにする。
         debug_frame = frame.copy()
+        magenta_overlay = np.zeros_like(frame)
+        magenta_overlay[:, :, 0] = magenta_mask
+        magenta_overlay[:, :, 2] = magenta_mask
+        debug_frame = cv2.addWeighted(debug_frame, 1.0, magenta_overlay, 0.4, 0)
         self.draw_detections(
             debug_frame,
-            red_detections,
-            color=(0, 0, 255),
-            label="red: right",
+            right_detections,
+            color=(255, 0, 255),
+            label="color frame",
         )
         self.draw_detections(
             debug_frame,
-            blue_detections,
-            color=(255, 0, 0),
-            label="blue: left",
+            left_detections,
+            color=(255, 0, 255),
+            label="color frame",
         )
         self.publish_debug_image(debug_frame, msg)
 
-    def make_red_mask(self, hsv):
-        # OpenCVのHSVでは赤がH=0付近とH=180付近に分かれる。
-        # 片側だけを見ると赤い物体の一部を取り逃すため、2つの範囲をORで結合する。
-        lower_red_1 = np.array([0, 80, 50], dtype=np.uint8)
-        upper_red_1 = np.array([10, 255, 255], dtype=np.uint8)
-        lower_red_2 = np.array([170, 80, 50], dtype=np.uint8)
-        upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
+    def make_magenta_mask(self, hsv):
+        # OpenCVのHSVではマゼンタはH=150付近。
+        # 照明で赤寄り/紫寄りに振れても拾えるよう少し広めに取る。
+        lower_magenta = np.array([135, 80, 50], dtype=np.uint8)
+        upper_magenta = np.array([170, 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower_magenta, upper_magenta)
 
-        mask_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
-        mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
-        return cv2.bitwise_or(mask_1, mask_2)
+    def split_detections_by_image_side(self, detections, image_width):
+        left_detections = []
+        right_detections = []
+        image_center_x = image_width / 2.0
+
+        for detection in detections:
+            center = detection.get("center")
+            if center is None:
+                continue
+
+            center_x, _ = center
+            if center_x < image_center_x:
+                left_detections.append(detection)
+            else:
+                right_detections.append(detection)
+
+        return left_detections, right_detections
 
     def find_frames(self, mask):
-        # OPENで孤立した小さな白ノイズを消し、CLOSEで色領域内の小さな穴を埋める。
-        # これにより、後段の輪郭検出でフレームが分断されにくくなる。
-        kernel = np.ones((5, 5), dtype=np.uint8)
-        cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        # OPENは細い枠線を消してしまうため使わない。
+        # CLOSEで途切れた枠線の隙間を埋めて4辺が繋がった輪郭にする。
+        kernel_large = np.ones((9, 9), dtype=np.uint8)
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
 
         # 外側の輪郭だけを使う。内側の穴や細かい内部輪郭は距離推定には不要。
         contours, _ = cv2.findContours(
@@ -280,25 +347,52 @@ class FindCubeNode(Node):
             # 面積が小さい輪郭は、遠方の誤検出や照明ノイズである可能性が高い。
             area = cv2.contourArea(contour)
             if area < self.min_contour_area:
+                self.get_logger().warn(
+                    f"contour rejected: area={area:.0f} < {self.min_contour_area}",
+                    throttle_duration_sec=1.0,
+                )
                 continue
 
-            # 外接矩形は、面積比によるざっくりした形状チェックと描画に使う。
+            if area > self.max_contour_area:
+                self.get_logger().warn(
+                    f"contour rejected: area={area:.0f} > {self.max_contour_area}",
+                    throttle_duration_sec=1.0,
+                )
+                continue
+
+            # bboxは描画用に軸平行の外接矩形を取る。
             x, y, width, height = cv2.boundingRect(contour)
-            bounding_area = width * height
-            if bounding_area == 0:
+
+            # rectangularity は「矩形に対して輪郭がどれだけ詰まっているか」。
+            # 軸平行のboundingRectだと斜め45度の正方形で面積比が0.5まで落ちてしまうため、
+            # 回転を考慮したminAreaRectで測って斜めの枠でも正しく評価する。
+            rot_rect = cv2.minAreaRect(contour)
+            rot_w, rot_h = rot_rect[1]
+            rot_area = rot_w * rot_h
+            if rot_area == 0:
                 continue
 
-            # rectangularity は「外接矩形に対して輪郭がどれだけ詰まっているか」。
             # 細い線、円弧、欠けた領域は値が低くなるのでここで除外する。
-            rectangularity = area / bounding_area
+            rectangularity = area / rot_area
             if rectangularity < self.min_rectangularity:
+                self.get_logger().warn(
+                    f"contour rejected: rect={rectangularity:.2f} < {self.min_rectangularity}",
+                    throttle_duration_sec=1.0,
+                )
                 continue
 
             # 輪郭点をそのまま見ると細かすぎるため、多角形近似で頂点数を減らす。
-            # 近似後に「凸な四角形か」「正方形に近いか」を判定する。
+            # 近似後に「4〜8頂点の四角形に近いか」を判定する。
             epsilon = self.polygon_epsilon_ratio * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
             if not self.is_square_like(approx):
+                rect = cv2.minAreaRect(approx)
+                w, h = rect[1]
+                aspect = (max(w, h) / min(w, h)) if min(w, h) > 0 else 999
+                self.get_logger().warn(
+                    f"contour rejected: vertices={len(approx)} aspect={aspect:.2f}",
+                    throttle_duration_sec=1.0,
+                )
                 continue
 
             # 後段の描画・距離計算で必要な情報をまとめて保持する。
@@ -469,6 +563,7 @@ class FindCubeNode(Node):
         )
         if base_transform is not None:
             transforms.append(base_transform)
+            self.save_detected_pose_to_yaml(key, base_transform)
 
         self.tf_broadcaster.sendTransform(transforms)
 
@@ -514,6 +609,8 @@ class FindCubeNode(Node):
             )
             return None
 
+        # detect_charuco.py と同じく、画像の親フレームから基準フレームへの
+        # TFを引いて、検出点をロボット基準(link_base)の座標へ変換して配信する。
         parent_position = np.array(position, dtype=np.float64)
         base_position = self.transform_point(base_to_parent, parent_position)
         return self.create_transform(
@@ -522,6 +619,67 @@ class FindCubeNode(Node):
             base_child_frame,
             base_position,
         )
+
+    def save_detected_pose_to_yaml(self, key, transform):
+        if not self.save_detected_pose:
+            return
+
+        now = self.get_clock().now()
+        last_time = self.last_pose_save_time.get(key)
+        if last_time is not None and self.pose_save_interval_sec > 0.0:
+            elapsed = (now - last_time).nanoseconds / 1e9
+            if elapsed < self.pose_save_interval_sec:
+                return
+
+        self.last_pose_save_time[key] = now
+
+        data = self.load_cube_pose_cache()
+        data.setdefault("cubes", {})
+        pose_record = {
+            "cube_pose": self.transform_to_cache_pose(transform),
+            "source": "find_cube_detection",
+        }
+        data["cubes"][key] = pose_record
+        data["cubes"]["latest"] = pose_record
+
+        os.makedirs(os.path.dirname(self.cube_pose_cache_file), exist_ok=True)
+        with open(self.cube_pose_cache_file, "w", encoding="utf-8") as file:
+            yaml.safe_dump(data, file, sort_keys=False)
+
+    def load_cube_pose_cache(self):
+        if not os.path.exists(self.cube_pose_cache_file):
+            return {"cubes": {}}
+
+        with open(self.cube_pose_cache_file, "r", encoding="utf-8") as file:
+            data = yaml.safe_load(file) or {}
+
+        if not isinstance(data, dict):
+            return {"cubes": {}}
+        data.setdefault("cubes", {})
+        return data
+
+    def transform_to_cache_pose(self, transform):
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        return {
+            "base_frame": transform.header.frame_id,
+            "child_frame": transform.child_frame_id,
+            "stamp": {
+                "sec": int(transform.header.stamp.sec),
+                "nanosec": int(transform.header.stamp.nanosec),
+            },
+            "translation_m": {
+                "x": float(translation.x),
+                "y": float(translation.y),
+                "z": float(translation.z),
+            },
+            "rotation_xyzw": {
+                "x": float(rotation.x),
+                "y": float(rotation.y),
+                "z": float(rotation.z),
+                "w": float(rotation.w),
+            },
+        }
 
     def transform_point(self, transform, point):
         translation = np.array([
@@ -561,12 +719,9 @@ class FindCubeNode(Node):
         ], dtype=np.float64)
 
     def is_square_like(self, approx):
-        # 検出対象は正方形フレームなので、まず4頂点の凸四角形だけを残す。
-        # その後、回転外接矩形の縦横比が1に近いかを確認する。
-        if len(approx) != 4:
-            return False
-
-        if not cv2.isContourConvex(approx):
+        # キューブを斜めから見ると複数面のマゼンタ枠が合わさって4〜8頂点の輪郭になる。
+        # 4頂点のみでは斜め視点を取り逃すため、4〜8頂点を許容する。
+        if not (4 <= len(approx) <= 8):
             return False
 
         rect = cv2.minAreaRect(approx)
@@ -574,10 +729,13 @@ class FindCubeNode(Node):
         if width == 0 or height == 0:
             return False
 
-        # 完全な正方形だけにすると傾きや検出誤差で落ちやすい。
-        # square_aspect_tolerance の分だけ縦横比のずれを許容する。
+        # 斜め姿勢や複数面がつながったマゼンタ枠では、見かけの外接矩形が
+        # 2倍以上に伸びることがあるため、透視歪み用の上限まで許容する。
         aspect_ratio = max(width, height) / min(width, height)
-        max_aspect_ratio = 1.0 + self.square_aspect_tolerance
+        max_aspect_ratio = max(
+            1.0 + self.square_aspect_tolerance,
+            self.max_frame_aspect_ratio,
+        )
         return aspect_ratio <= max_aspect_ratio
 
     def draw_detections(self, frame, detections, color, label):
