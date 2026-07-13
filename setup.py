@@ -34,6 +34,7 @@ setup(
             'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',
             'detect_apriltag = charuco_ros2.detect_apriltag:main',
             'move_to_charuco = charuco_ros2.move_to_charuco:main',
+            'sweep_cube_targets = charuco_ros2.sweep_cube_targets:main',
             'find_cube = charuco_ros2.find_cube:main',
         ],
     },

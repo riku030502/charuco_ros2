@@ -21,11 +21,11 @@ class MultiCharucoDetectorNode(Node):
         # =========================
         # Parameters
         # =========================
-        self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/camera/color/camera_info")
+        self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
         self.declare_parameter("debug_image_topic", "/charuco/debug_image")
 
-        self.declare_parameter("parent_frame", "camera_color_optical_frame")
+        self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
 
         # =========================
         # ChArUco board parameters
@@ -36,6 +36,17 @@ class MultiCharucoDetectorNode(Node):
         self.declare_parameter("square_length", 0.010)  # [m]
         self.declare_parameter("marker_length", 0.007)  # [m]
         self.declare_parameter("cube_size", 0.050)  # [m] キューブ一辺の長さ
+
+        # =========================
+        # Pose estimation
+        # =========================
+        # ChArUcoの内部チェス盤コーナーは4x4ボードで9点しかなく、1点補間する
+        # だけでも周囲のマーカーが解像されている必要がある。小さいマーカーを
+        # 遠く/斜めから見るとマーカーは読めてもコーナーが揃わず姿勢を捨てる
+        # ことになるため、その場合はマーカーの角そのものでPnPを解く。
+        # マーカー1個につき4点得られる。
+        self.declare_parameter("allow_marker_only_pose", True)
+        self.declare_parameter("min_markers_for_pose", 2)
 
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
@@ -48,6 +59,12 @@ class MultiCharucoDetectorNode(Node):
         self.square_length = self.get_parameter("square_length").value
         self.marker_length = self.get_parameter("marker_length").value
         self.cube_size = self.get_parameter("cube_size").value
+        self.allow_marker_only_pose = bool(
+            self.get_parameter("allow_marker_only_pose").value
+        )
+        self.min_markers_for_pose = int(
+            self.get_parameter("min_markers_for_pose").value
+        )
 
         # =========================
         # Board ID configs
@@ -476,59 +493,39 @@ class MultiCharucoDetectorNode(Node):
             marker_ids,
         )
 
-        # solvePnPには最低4点は欲しい
-        if charuco_ids is None or len(charuco_ids) < 4:
-            return {
-                "name": config["name"],
-                "cube_name": config["cube_name"],
-                "face_name": config["face_name"],
-                "child_frame": config["child_frame"],
-                "num_markers": num_markers,
-                "num_corners": 0 if charuco_ids is None else len(charuco_ids),
-                "pose_success": False,
-            }
+        num_corners = 0 if charuco_ids is None else len(charuco_ids)
 
-        cv2.aruco.drawDetectedCornersCharuco(
-            debug_frame,
-            charuco_corners,
-            charuco_ids,
-            (0, 255, 255),
-        )
+        if num_corners >= 4:
+            cv2.aruco.drawDetectedCornersCharuco(
+                debug_frame,
+                charuco_corners,
+                charuco_ids,
+                (0, 255, 255),
+            )
 
         # =========================
         # Estimate pose
         # =========================
-        object_points = board.getChessboardCorners()[
-            charuco_ids.flatten()
-        ].astype(np.float32)
+        pose = self.estimate_board_pose(
+            entry=entry,
+            charuco_corners=charuco_corners,
+            charuco_ids=charuco_ids,
+            marker_corners=marker_corners,
+            marker_ids=marker_ids,
+        )
 
-        image_points = charuco_corners.reshape(-1, 2).astype(np.float32)
-
-        try:
-            success, rvec, tvec = cv2.solvePnP(
-                object_points,
-                image_points,
-                self.camera_matrix,
-                self.dist_coeffs,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
-        except cv2.error as e:
-            self.get_logger().debug(
-                f"{config['name']} solvePnP skipped: {e}",
-                throttle_duration_sec=2.0,
-            )
-            return None
-
-        if not success:
+        if pose is None:
             return {
                 "name": config["name"],
                 "cube_name": config["cube_name"],
                 "face_name": config["face_name"],
                 "child_frame": config["child_frame"],
                 "num_markers": num_markers,
-                "num_corners": len(charuco_ids),
+                "num_corners": num_corners,
                 "pose_success": False,
             }
+
+        rvec, tvec, pose_source = pose
 
         # 座標軸を描画
         cv2.drawFrameAxes(
@@ -558,7 +555,9 @@ class MultiCharucoDetectorNode(Node):
             debug_frame=debug_frame,
             config=config,
             charuco_corners=charuco_corners,
+            marker_corners=marker_corners,
             tvec=tvec,
+            pose_source=pose_source,
         )
 
         return {
@@ -567,22 +566,144 @@ class MultiCharucoDetectorNode(Node):
             "face_name": config["face_name"],
             "child_frame": config["child_frame"],
             "num_markers": num_markers,
-            "num_corners": len(charuco_ids),
+            "num_corners": num_corners,
             "pose_success": True,
+            "pose_source": pose_source,
             "tvec": tvec,
         }
 
-    def draw_board_label(self, debug_frame, config: dict, charuco_corners, tvec):
+    def estimate_board_pose(
+        self,
+        entry: dict,
+        charuco_corners,
+        charuco_ids,
+        marker_corners,
+        marker_ids,
+    ):
+        """Estimate the board pose, falling back to the marker corners.
+
+        戻り値は (rvec, tvec, pose_source) か None。
+
+        chessboard: ChArUcoの内部コーナーを使う。精度が高いので優先する。
+        marker:     マーカーの角を使う。コーナーが揃わない小さな/斜めの見え方
+                    でも、マーカーが読めていれば姿勢を出せる。
+        """
+        board = entry["board"]
+        config = entry["config"]
+
+        if charuco_ids is not None and len(charuco_ids) >= 4:
+            object_points = board.getChessboardCorners()[
+                charuco_ids.flatten()
+            ].astype(np.float32)
+            image_points = charuco_corners.reshape(-1, 2).astype(np.float32)
+
+            pose = self.solve_pnp_planar(object_points, image_points, config)
+            if pose is not None:
+                return pose[0], pose[1], "chessboard"
+
+        if not self.allow_marker_only_pose:
+            return None
+
+        object_points, image_points = self.match_marker_points(
+            entry,
+            marker_corners,
+            marker_ids,
+        )
+        if object_points is None:
+            return None
+
+        pose = self.solve_pnp_planar(object_points, image_points, config)
+        if pose is None:
+            return None
+
+        return pose[0], pose[1], "marker"
+
+    def match_marker_points(self, entry: dict, marker_corners, marker_ids):
+        """Pair detected marker corners with their 3D positions on the board."""
+        board = entry["board"]
+
+        board_ids = board.getIds().flatten()
+        board_object_points = board.getObjPoints()
+        id_to_index = {
+            int(marker_id): index
+            for index, marker_id in enumerate(board_ids)
+        }
+
+        object_points = []
+        image_points = []
+
+        for corners, marker_id in zip(marker_corners, marker_ids.flatten()):
+            index = id_to_index.get(int(marker_id))
+            if index is None:
+                continue
+
+            object_points.append(
+                np.asarray(board_object_points[index], dtype=np.float32).reshape(4, 3)
+            )
+            image_points.append(
+                np.asarray(corners, dtype=np.float32).reshape(4, 2)
+            )
+
+        if len(object_points) < self.min_markers_for_pose:
+            return None, None
+
+        return (
+            np.concatenate(object_points, axis=0),
+            np.concatenate(image_points, axis=0),
+        )
+
+    def solve_pnp_planar(self, object_points, image_points, config: dict):
+        """Solve PnP for coplanar points.
+
+        ボード面上の点は同一平面なので、平面専用のIPPEを使う。
+        ITERATIVEは平面かつ点数が少ないと不安定になりやすい。
+        """
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points,
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE,
+            )
+        except cv2.error as e:
+            self.get_logger().debug(
+                f"{config['name']} solvePnP skipped: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        if not success:
+            return None
+
+        return rvec, tvec
+
+    def draw_board_label(
+        self,
+        debug_frame,
+        config: dict,
+        charuco_corners,
+        marker_corners,
+        tvec,
+        pose_source: str,
+    ):
         """検出したboard名を画像上に描画する。"""
 
-        points = charuco_corners.reshape(-1, 2)
+        # マーカーのみで解いた場合、ChArUcoコーナーは無いこともある。
+        if charuco_corners is not None and len(charuco_corners) > 0:
+            points = np.asarray(charuco_corners).reshape(-1, 2)
+        else:
+            points = np.concatenate(
+                [np.asarray(corners).reshape(-1, 2) for corners in marker_corners],
+                axis=0,
+            )
 
         x = int(np.mean(points[:, 0]))
         y = int(np.mean(points[:, 1]))
 
         text = (
             f"{config['cube_name']} {config['face_name']} "
-            f"z={float(tvec[2][0]):.3f}m"
+            f"z={float(tvec[2][0]):.3f}m [{pose_source}]"
         )
 
         cv2.putText(

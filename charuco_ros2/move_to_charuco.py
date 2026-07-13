@@ -44,6 +44,7 @@ DEFAULT_SPEED = 0.035  # 0.1x of the xArm README example 0.35 rad/s
 DEFAULT_ACC = 1.0  # 0.1x of the xArm README example 10 rad/s^2
 MOVE_JOINT_TYPE = "xarm_msgs/srv/MoveJoint"
 MOVE_CARTESIAN_TYPE = "xarm_msgs/srv/MoveCartesian"
+JOINT1_LIMIT_RAD = 2.0 * math.pi
 
 
 class MoveToCharucoPoseNode(Node):
@@ -86,7 +87,10 @@ class MoveToCharucoPoseNode(Node):
         self.declare_parameter("use_cached_cube_pose", True)
         self.declare_parameter("cube_lookup_timeout", 0.5)
         # xArm6の可動範囲端を避けるため、キューブから30 cm手前を使用する。
-        self.declare_parameter("cube_approach_offset_m", 0.05)
+        self.declare_parameter("cube_approach_offset_m", 0.30)
+        # radial: link_base->cube方向へ後退する。cubeが横にあれば横から接近する。
+        # x_axis: cubeのY/Zに合わせ、X方向にだけ後退する（従来動作）。
+        self.declare_parameter("cube_approach_mode", "radial")
         # link_baseから手先目標までの最大距離。
         # xArm6の姿勢制約を考慮し、公称最大リーチより内側に制限する。
         self.declare_parameter("cartesian_max_target_distance_m", 1.5)
@@ -105,10 +109,10 @@ class MoveToCharucoPoseNode(Node):
         # カメラ方向は下のcartesian_camera_up_directionで直接決めるため、
         # 通常は0 radのまま使用する。
         self.declare_parameter("cartesian_roll_rad", 0.0)
+        # point_at_cube: 手先前方をキューブへ向ける（キューブに正対する）
         # front_fixed: 手先前方をlink_baseの指定方向へ固定
-        # point_at_cube: 手先前方をキューブへ向ける
         # fixed: cartesian_rpy_radをそのまま使用
-        self.declare_parameter("cartesian_orientation_mode", "front_fixed")
+        self.declare_parameter("cartesian_orientation_mode", "point_at_cube")
         self.declare_parameter(
             "cartesian_front_direction",
             [1.0, 0.0, 0.0],
@@ -120,20 +124,39 @@ class MoveToCharucoPoseNode(Node):
             "cartesian_camera_up_direction",
             [0.0, 0.0, 1.0],
         )
+        # point_at_cubeで手先前方をキューブへ向けるとき、上下の傾きを捨てて
+        # 水平に保つ。cube_target_z_offset_mを付けると手先はキューブより下に
+        # 来るため、そのまま向けると手先が上を向く。高さオフセットは維持した
+        # まま、向きだけ水平にしたい場合にtrueにする。
+        self.declare_parameter("cartesian_level_tool_forward", True)
         self.declare_parameter("cartesian_point_axis_sign", 1.0)
         self.declare_parameter("cartesian_motion_type", 0)
         self.declare_parameter("prepare_xarm_before_cartesian", True)
         self.declare_parameter("cartesian_mode", 0)
         self.declare_parameter("cartesian_state", 0)
+        # realでもsimと同じ経路を通す。
+        # falseだとxArmの set_position を使うが、その場合IKを解くのはMoveItでは
+        # なくxArmのファームウェアであり、選ばれる分岐も経路生成もsimと一致
+        # しない。simで確認した動きをそのまま実機で再現したいならtrueにする。
+        # /compute_ik が無い場合は set_position へフォールバックする。
+        self.declare_parameter("real_use_moveit_ik", True)
         self.declare_parameter("sim_ik_service_name", "/compute_ik")
         self.declare_parameter("sim_ik_group_name", "xarm6")
         self.declare_parameter("sim_ik_link_name", "link_eef")
         self.declare_parameter("sim_ik_timeout", 2.0)
         self.declare_parameter("sim_avoid_collisions", True)
         self.declare_parameter("sim_cartesian_move_duration", 5.0)
-        # side_poseはleft/rightの既知姿勢をIK初期値に使い、
-        # 肘が逆側へ回り込む解を選びにくくする。
-        self.declare_parameter("sim_ik_seed_mode", "side_pose")
+        # KDLはシード近傍の解へ収束する反復ソルバなので、シードが現在姿勢から離れているほど、現在姿勢から遠い分岐（同じ手先ポーズを実現する別の関節解）が返り、移動量が無駄に大きくなる。
+        # current: 現在の関節角をシードにする。移動量が最小の分岐に落ちやすい。
+        # side_pose: left/rightの決め打ち定数。現在姿勢と無関係なので非推奨。
+        # current_or_side: 現在角が取れなければside_poseへフォールバック。
+        self.declare_parameter("sim_ik_seed_mode", "current_or_side")
+        # 先にjoint1だけを目標方位へ回してからIKを解く。
+        # ただしIKは同じ手先ポーズを実現する別分岐（腕を真逆へ向けて後ろへ反り返る解など）を返すことがあり、その場合joint1は整列させた角度から大きく戻されるため、事前整列はかえって総移動量を増やす。
+        # 目標が遠くて正面向きの分岐が存在しない配置では特に起きるので、既定はfalse。
+        self.declare_parameter("align_joint1_before_move", False)
+        self.declare_parameter("joint1_align_duration", 3.0)
+        self.declare_parameter("joint1_align_tolerance_deg", 2.0)
 
         self.server_service_name = self.get_parameter("server_service_name").value
         self.execution_mode = self.get_parameter("execution_mode").value.lower()
@@ -178,6 +201,9 @@ class MoveToCharucoPoseNode(Node):
         self.cube_approach_offset_m = float(
             self.get_parameter("cube_approach_offset_m").value
         )
+        self.cube_approach_mode = self.get_parameter(
+            "cube_approach_mode"
+        ).value.lower()
         self.cartesian_max_target_distance_m = float(
             self.get_parameter(
                 "cartesian_max_target_distance_m"
@@ -213,6 +239,9 @@ class MoveToCharucoPoseNode(Node):
                 "cartesian_camera_up_direction"
             ).value
         )
+        self.cartesian_level_tool_forward = bool(
+            self.get_parameter("cartesian_level_tool_forward").value
+        )
         self.cartesian_point_axis_sign = float(
             self.get_parameter("cartesian_point_axis_sign").value
         )
@@ -224,6 +253,9 @@ class MoveToCharucoPoseNode(Node):
         )
         self.cartesian_mode = int(self.get_parameter("cartesian_mode").value)
         self.cartesian_state = int(self.get_parameter("cartesian_state").value)
+        self.real_use_moveit_ik = bool(
+            self.get_parameter("real_use_moveit_ik").value
+        )
         self.sim_ik_service_name = self.get_parameter(
             "sim_ik_service_name"
         ).value
@@ -245,6 +277,15 @@ class MoveToCharucoPoseNode(Node):
         self.sim_ik_seed_mode = self.get_parameter(
             "sim_ik_seed_mode"
         ).value.lower()
+        self.align_joint1_before_move = bool(
+            self.get_parameter("align_joint1_before_move").value
+        )
+        self.joint1_align_duration = float(
+            self.get_parameter("joint1_align_duration").value
+        )
+        self.joint1_align_tolerance_rad = math.radians(
+            float(self.get_parameter("joint1_align_tolerance_deg").value)
+        )
 
         if self.camera_side == "left":
             self.side_joint_degrees = self.left_joint_degrees
@@ -266,6 +307,8 @@ class MoveToCharucoPoseNode(Node):
             raise ValueError(
                 "cartesian_max_target_distance_m must be positive"
             )
+        if self.cube_approach_mode not in ("radial", "x_axis"):
+            raise ValueError("cube_approach_mode must be 'radial' or 'x_axis'")
         if len(self.cartesian_rpy_rad) != 3:
             raise ValueError("cartesian_rpy_rad must contain roll, pitch, yaw")
         if self.cartesian_orientation_mode not in (
@@ -389,13 +432,33 @@ class MoveToCharucoPoseNode(Node):
             f"mode={self.cartesian_orientation_mode}, "
             f"tool_axis_roll={math.degrees(self.cartesian_roll_rad):.1f} deg, "
             f"front_direction={self.cartesian_front_direction}, "
-            f"camera_direction={self.cartesian_camera_up_direction} "
+            f"camera_direction={self.cartesian_camera_up_direction}, "
+            f"level_tool_forward={self.cartesian_level_tool_forward} "
             "(real and simulation)"
         )
-        if self.execution_mode == "sim":
-            self.get_logger().info(
-                f"Simulation IK seed mode: {self.sim_ik_seed_mode}"
-            )
+        self.get_logger().info(
+            f"IK seed mode: {self.sim_ik_seed_mode}"
+        )
+        if self.execution_mode == "real":
+            if self.real_use_moveit_ik:
+                self.get_logger().info(
+                    "Cartesian moves use MoveIt IK -> set_servo_angle, "
+                    "so the motion matches execution_mode:=sim"
+                )
+            else:
+                self.get_logger().warn(
+                    "real_use_moveit_ik is false: Cartesian moves use the xArm "
+                    "set_position service, which solves the IK and plans the "
+                    "motion inside the xArm firmware. The motion will NOT "
+                    "match execution_mode:=sim."
+                )
+        self.get_logger().info(
+            "joint1 alignment before Cartesian moves: "
+            f"{self.align_joint1_before_move} "
+            f"(duration={self.joint1_align_duration:.1f}s, "
+            "tolerance="
+            f"{math.degrees(self.joint1_align_tolerance_rad):.1f} deg)"
+        )
         self.get_logger().info(
             f"Cube TF move services ready: {self.server_service_name}/cube | "
             f"{self.server_service_name}/cube_left | "
@@ -404,6 +467,7 @@ class MoveToCharucoPoseNode(Node):
         self.get_logger().info(
             f"cube_base_frame={self.cube_base_frame}, "
             f"cache={self.cube_pose_cache_file}, "
+            f"approach_mode={self.cube_approach_mode}, "
             f"approach_offset={self.cube_approach_offset_m:.3f} m, "
             f"max_target_distance="
             f"{self.cartesian_max_target_distance_m:.3f} m, "
@@ -626,7 +690,8 @@ class MoveToCharucoPoseNode(Node):
 
         move_duration = request.mvtime if request.mvtime > 0.0 else self.default_move_duration
         trajectory = JointTrajectory()
-        trajectory.header.stamp = self.get_clock().now().to_msg()
+        # stampはゼロのままにする。ゼロ以外を入れると、コントローラへ届く頃には
+        # その時刻が過去になっており、軌道が拒否される。
         trajectory.joint_names = self.joint_names
 
         point = JointTrajectoryPoint()
@@ -821,6 +886,108 @@ class MoveToCharucoPoseNode(Node):
         }
 
     def compute_approach_position(self, cube_pose):
+        if self.cube_approach_mode == "radial":
+            return self.compute_radial_approach_position(cube_pose)
+        return self.compute_x_axis_approach_position(cube_pose)
+
+    def compute_radial_approach_position(self, cube_pose):
+        """Stand off along the link_base->cube direction.
+
+        キューブが横にあれば後退方向も横向きになるため、手先はキューブへ
+        正対したまま真横から接近する。cubeが正面(+X)にある場合は
+        x_axisモードと同じ結果になる。
+        """
+        translation = cube_pose["translation_m"]
+        cube_x = float(translation["x"])
+        cube_y = float(translation["y"])
+        cube_z = float(translation["z"])
+
+        # 高さオフセットは従来どおりZへ直接加え、後退は水平方向のみで行う。
+        look_at = np.array(
+            [cube_x, cube_y, cube_z + self.cube_target_z_offset_m],
+            dtype=np.float64,
+        )
+
+        horizontal = np.array([cube_x, cube_y, 0.0], dtype=np.float64)
+        horizontal_distance = float(np.linalg.norm(horizontal))
+        if horizontal_distance <= 1e-6:
+            raise ValueError(
+                "cube is directly above/below link_base; the approach "
+                "direction is undefined"
+            )
+        approach_direction = horizontal / horizontal_distance
+
+        if horizontal_distance <= self.cube_approach_offset_m:
+            raise ValueError(
+                "cube_approach_offset_m is larger than the cube horizontal "
+                "distance from link_base"
+            )
+
+        standoff = self.solve_reachable_standoff(look_at, approach_direction)
+        target = look_at - approach_direction * standoff
+
+        approach_position = {
+            "x": float(target[0]),
+            "y": float(target[1]),
+            "z": float(target[2]),
+        }
+
+        self.get_logger().info(
+            "Cube radial approach: "
+            f"cube_position=[{cube_x:.3f}, {cube_y:.3f}, {cube_z:.3f}] m, "
+            f"target_position=["
+            f"{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}] m, "
+            f"approach_direction=["
+            f"{approach_direction[0]:.3f}, "
+            f"{approach_direction[1]:.3f}, "
+            f"{approach_direction[2]:.3f}], "
+            f"requested_standoff={self.cube_approach_offset_m:.3f} m, "
+            f"actual_standoff={standoff:.3f} m, "
+            f"cube_distance={float(np.linalg.norm(look_at - target)):.3f} m, "
+            f"target_distance_from_base={float(np.linalg.norm(target)):.3f} m"
+        )
+
+        if standoff > self.cube_approach_offset_m + 1e-6:
+            self.get_logger().warn(
+                "The requested standoff put the target outside the configured "
+                "workspace. Kept the approach direction and increased the "
+                f"standoff from {self.cube_approach_offset_m:.3f} m to "
+                f"{standoff:.3f} m."
+            )
+
+        return approach_position
+
+    def solve_reachable_standoff(self, look_at, approach_direction):
+        """Smallest standoff along -approach_direction that stays reachable.
+
+        |look_at - t * u| <= max_distance を満たす最小の t を求める。
+        t^2 - 2 (look_at・u) t + (|look_at|^2 - max^2) = 0 の小さい方の根。
+        """
+        requested = self.cube_approach_offset_m
+        max_distance = self.cartesian_max_target_distance_m
+
+        if float(np.linalg.norm(look_at - approach_direction * requested)) <= max_distance:
+            return requested
+
+        projection = float(np.dot(look_at, approach_direction))
+        discriminant = (
+            projection ** 2
+            - float(np.dot(look_at, look_at))
+            + max_distance ** 2
+        )
+        if discriminant < 0.0:
+            raise ValueError(
+                "cube is outside the configured Cartesian workspace along the "
+                "approach direction: "
+                f"cube_distance_from_base={float(np.linalg.norm(look_at)):.3f} m, "
+                f"max_target_distance={max_distance:.3f} m. "
+                "Increase cartesian_max_target_distance_m or change the "
+                "robot/cube arrangement."
+            )
+
+        return max(requested, projection - math.sqrt(discriminant))
+
+    def compute_x_axis_approach_position(self, cube_pose):
         """Match the cube Y/Z position and keep standoff only along X."""
         translation = cube_pose["translation_m"]
         cube_x = float(translation["x"])
@@ -991,9 +1158,18 @@ class MoveToCharucoPoseNode(Node):
         ], dtype=np.float64)
 
         direction = cube_position - approach_position
+
+        if self.cartesian_level_tool_forward:
+            # 上下成分を捨て、手先前方を水平に保つ。
+            direction[2] = 0.0
+
         norm = np.linalg.norm(direction)
         if norm <= 1e-6:
-            raise ValueError("approach pose and cube pose are too close")
+            raise ValueError(
+                "approach pose and cube pose are too close, or the cube is "
+                "directly above/below the approach pose while "
+                "cartesian_level_tool_forward is enabled"
+            )
 
         direction /= norm
         if self.cartesian_point_axis_sign < 0.0:
@@ -1126,7 +1302,90 @@ class MoveToCharucoPoseNode(Node):
                 cartesian_pose,
                 side,
             )
+
+        if self.real_use_moveit_ik:
+            success, message = self.move_with_real_ik_pose(cartesian_pose, side)
+            if success:
+                return True, message
+
+            self.get_logger().warn(
+                f"Falling back to the xArm set_position path: {message}. "
+                "The xArm firmware will solve the IK and plan the motion "
+                "itself, so the result will NOT match execution_mode:=sim."
+            )
+
         return self.move_with_real_cartesian_pose(cartesian_pose)
+
+    def move_with_real_ik_pose(self, cartesian_pose, side="latest"):
+        """Solve with MoveIt IK, then send the joints to the real xArm.
+
+        simと同じIK・同じ関節指令を使うため、simで確認した動きが実機でも
+        そのまま再現される。set_positionはxArm側でIKと経路生成を行うため
+        simと一致しない。
+        """
+        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
+            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
+
+        success, target_positions, message = self.request_ik_solution(
+            cartesian_pose,
+            side,
+        )
+        if not success:
+            return False, message
+
+        return self.move_joints_with_xarm(target_positions)
+
+    def move_joints_with_xarm(self, target_positions):
+        """Send joint angles to the real xArm with set_servo_angle."""
+        service_name = self.resolve_xarm_service_name()
+        if service_name is None:
+            return False, "xArm set_servo_angle service not found"
+
+        client = self.create_client(
+            MoveJoint,
+            service_name,
+            callback_group=self.callback_group,
+        )
+        if not client.wait_for_service(timeout_sec=10.0):
+            return False, f"xArm service not available: {service_name}"
+
+        success, message = self.prepare_xarm_for_cartesian()
+        if not success:
+            return False, message
+
+        request = MoveJoint.Request()
+        request.angles = [float(value) for value in target_positions]
+        request.speed = self.default_speed
+        request.acc = self.default_acc
+        request.mvtime = 0.0
+        request.wait = True
+        request.timeout = self.default_timeout
+        request.radius = self.default_radius
+        request.relative = False
+
+        self.get_logger().info(
+            f"Moving joints via {service_name}: angles_deg="
+            f"{[round(math.degrees(v), 1) for v in target_positions]}, "
+            f"speed={request.speed} rad/s, acc={request.acc} rad/s^2"
+        )
+
+        future = client.call_async(request)
+        if not self.wait_for_future(future, request.timeout + 5.0):
+            return False, "Timed out waiting for xArm set_servo_angle response"
+
+        if future.exception() is not None:
+            return False, f"set_servo_angle failed: {future.exception()}"
+
+        result = future.result()
+        if result.ret != 0:
+            return (
+                False,
+                f"set_servo_angle failed: ret={result.ret}, "
+                f"message={result.message}",
+            )
+
+        self.wait_for_joint_state_target(target_positions)
+        return True, "real Cartesian move succeeded via MoveIt IK -> " + service_name
 
     def move_with_real_cartesian_pose(self, cartesian_pose):
         cartesian_client = self.get_cartesian_client()
@@ -1144,6 +1403,11 @@ class MoveToCharucoPoseNode(Node):
             success, message = self.prepare_xarm_for_cartesian()
             if not success:
                 return False, message
+
+        if self.align_joint1_before_move:
+            success, message = self.align_joint1_with_xarm(cartesian_pose)
+            if not success:
+                return False, f"joint1 alignment failed: {message}"
 
         request = MoveCartesian.Request()
         request.pose = [float(value) for value in cartesian_pose]
@@ -1183,6 +1447,87 @@ class MoveToCharucoPoseNode(Node):
 
         return True, result.message if result.message else "success"
 
+    def align_joint1_with_xarm(self, cartesian_pose):
+        """Rotate joint1 to the target azimuth with set_servo_angle."""
+        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
+            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
+
+        current_positions = self.get_current_joint_positions()
+        if current_positions is None:
+            return (
+                False,
+                f"No joint state on {self.joint_state_topic}; cannot rotate "
+                "joint1 before the Cartesian move.",
+            )
+
+        target_joint1 = self.compute_target_joint1_rad(
+            cartesian_pose,
+            current_positions[0],
+        )
+        if target_joint1 is None:
+            self.get_logger().warn(
+                "The target is on the link_base Z axis, so the joint1 azimuth "
+                "is undefined; skipping the alignment move."
+            )
+            return True, "joint1 azimuth undefined"
+
+        if abs(target_joint1 - current_positions[0]) <= self.joint1_align_tolerance_rad:
+            self.get_logger().info(
+                "joint1 is already on the target azimuth "
+                f"({math.degrees(current_positions[0]):.1f} deg); "
+                "skipping the alignment move."
+            )
+            return True, "joint1 already aligned"
+
+        service_name = self.resolve_xarm_service_name()
+        if service_name is None:
+            return False, "xArm set_servo_angle service not found"
+
+        client = self.create_client(
+            MoveJoint,
+            service_name,
+            callback_group=self.callback_group,
+        )
+        if not client.wait_for_service(timeout_sec=10.0):
+            return False, f"xArm service not available: {service_name}"
+
+        aligned_positions = list(current_positions)
+        aligned_positions[0] = float(target_joint1)
+
+        request = MoveJoint.Request()
+        request.angles = aligned_positions
+        request.speed = self.default_speed
+        request.acc = self.default_acc
+        request.mvtime = 0.0
+        request.wait = True
+        request.timeout = self.default_timeout
+        request.radius = self.default_radius
+        request.relative = False
+
+        self.get_logger().info(
+            "Aligning joint1 before the Cartesian move: "
+            f"{math.degrees(current_positions[0]):.1f} deg -> "
+            f"{math.degrees(target_joint1):.1f} deg via {service_name}"
+        )
+
+        future = client.call_async(request)
+        if not self.wait_for_future(future, request.timeout + 5.0):
+            return False, "Timed out waiting for the joint1 alignment response"
+
+        if future.exception() is not None:
+            return False, f"set_servo_angle failed: {future.exception()}"
+
+        result = future.result()
+        if result.ret != 0:
+            return (
+                False,
+                f"set_servo_angle failed: ret={result.ret}, "
+                f"message={result.message}",
+            )
+
+        self.wait_for_joint_state_target(aligned_positions)
+        return True, result.message if result.message else "success"
+
     def get_sim_ik_client(self):
         if GetPositionIK is None:
             return None
@@ -1210,37 +1555,132 @@ class MoveToCharucoPoseNode(Node):
             degrees = self.right_joint_degrees
         return [math.radians(value) for value in degrees]
 
-    def get_sim_ik_seed_positions(self, side):
+    def get_sim_ik_seed_positions(self, side, joint1_rad=None):
         current_positions = self.get_current_joint_positions()
 
         if self.sim_ik_seed_mode == "current":
-            return current_positions, "current"
-
-        if self.sim_ik_seed_mode == "current_or_side":
+            seed, source = current_positions, "current"
+        elif self.sim_ik_seed_mode == "current_or_side":
             if current_positions is not None:
-                return current_positions, "current"
-            return self.get_side_pose_seed(side), "side_pose"
+                seed, source = current_positions, "current"
+            else:
+                seed, source = self.get_side_pose_seed(side), "side_pose"
+        else:
+            seed, source = self.get_side_pose_seed(side), "side_pose"
 
-        return self.get_side_pose_seed(side), "side_pose"
+        if seed is not None and joint1_rad is not None:
+            seed = list(seed)
+            seed[0] = float(joint1_rad)
+            source = f"{source}+joint1_aligned"
 
-    def move_with_sim_cartesian_pose(self, cartesian_pose, side="latest"):
-        """Convert a Cartesian target to joints with MoveIt IK, then use ros2_control."""
+        return seed, source
+
+    def compute_target_joint1_rad(self, cartesian_pose, current_joint1=None):
+        """joint1 angle that puts the arm plane on the target azimuth.
+
+        link_baseから見た目標のXY方位をそのままjoint1にする。
+        joint1は±2piまで回せるため、現在角に最も近い等価角を選ぶ。
+        """
+        target_x = float(cartesian_pose[0])
+        target_y = float(cartesian_pose[1])
+        if math.hypot(target_x, target_y) <= 1e-6:
+            return None
+
+        yaw = math.atan2(target_y, target_x)
+        if current_joint1 is None:
+            return yaw
+
+        best = None
+        for turn in (-1, 0, 1):
+            candidate = yaw + 2.0 * math.pi * turn
+            if abs(candidate) > JOINT1_LIMIT_RAD:
+                continue
+            if best is None or abs(candidate - current_joint1) < abs(
+                best - current_joint1
+            ):
+                best = candidate
+        return yaw if best is None else best
+
+    def execute_joint_positions(self, target_positions, duration):
+        request = MoveJoint.Request()
+        request.angles = [float(value) for value in target_positions]
+        request.mvtime = float(duration)
+        request.wait = True
+        response = MoveJoint.Response()
+
+        if self.get_effective_joint_backend() == "topic":
+            result = self.move_with_joint_trajectory_topic(
+                target_positions,
+                target_positions,
+                request,
+                response,
+            )
+        else:
+            result = self.move_with_joint_trajectory(
+                target_positions,
+                target_positions,
+                request,
+                response,
+            )
+
+        if result.ret != FollowJointTrajectory.Result.SUCCESSFUL:
+            return False, result.message
+        return True, result.message
+
+    def align_joint1_with_trajectory(self, target_joint1, side):
+        """Rotate joint1 only, keeping the other joints where they are."""
+        current_positions = self.get_current_joint_positions()
+        if current_positions is None:
+            current_positions = self.get_side_pose_seed(side)
+            self.get_logger().warn(
+                "No joint state available for the joint1 alignment; "
+                "starting from the side pose instead."
+            )
+
+        if abs(target_joint1 - current_positions[0]) <= self.joint1_align_tolerance_rad:
+            self.get_logger().info(
+                "joint1 is already on the target azimuth "
+                f"({math.degrees(current_positions[0]):.1f} deg); "
+                "skipping the alignment move."
+            )
+            return True, "joint1 already aligned"
+
+        aligned_positions = list(current_positions)
+        aligned_positions[0] = float(target_joint1)
+
+        self.get_logger().info(
+            "Aligning joint1 before the Cartesian move: "
+            f"{math.degrees(current_positions[0]):.1f} deg -> "
+            f"{math.degrees(target_joint1):.1f} deg, "
+            f"duration={self.joint1_align_duration:.1f}s"
+        )
+
+        return self.execute_joint_positions(
+            aligned_positions,
+            self.joint1_align_duration,
+        )
+
+    def request_ik_solution(self, cartesian_pose, side="latest", target_joint1=None):
+        """Ask MoveIt for the joint solution of a Cartesian pose.
+
+        Returns (success, joint_positions_rad or None, message).
+        軌道は送らないので、到達性や選ばれる分岐の確認にも使える。
+        """
         ik_client = self.get_sim_ik_client()
         if ik_client is None:
             return (
                 False,
+                None,
                 "moveit_msgs is not installed. Install/source MoveIt before "
                 "using execution_mode:=sim.",
             )
         if not ik_client.wait_for_service(timeout_sec=10.0):
             return (
                 False,
+                None,
                 f"MoveIt IK service not available: {self.sim_ik_service_name}. "
                 "Start the xArm MoveIt fake/simulation launch.",
             )
-
-        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
-            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
 
         pose_stamped = PoseStamped()
         pose_stamped.header.frame_id = self.cube_base_frame
@@ -1272,7 +1712,10 @@ class MoveToCharucoPoseNode(Node):
         ik_request.ik_request.avoid_collisions = self.sim_avoid_collisions
         ik_request.ik_request.robot_state.is_diff = True
 
-        seed_positions, seed_source = self.get_sim_ik_seed_positions(side)
+        seed_positions, seed_source = self.get_sim_ik_seed_positions(
+            side,
+            target_joint1,
+        )
         if seed_positions is not None:
             ik_request.ik_request.robot_state.joint_state.name = list(
                 self.joint_names
@@ -1298,15 +1741,20 @@ class MoveToCharucoPoseNode(Node):
             future,
             self.sim_ik_timeout + 10.0,
         ):
-            return False, "Timed out waiting for MoveIt IK response"
+            return False, None, "Timed out waiting for MoveIt IK response"
 
         if future.exception() is not None:
-            return False, f"MoveIt IK service call failed: {future.exception()}"
+            return (
+                False,
+                None,
+                f"MoveIt IK service call failed: {future.exception()}",
+            )
 
         ik_response = future.result()
         if ik_response.error_code.val != MoveItErrorCodes.SUCCESS:
             return (
                 False,
+                None,
                 "MoveIt IK failed: "
                 f"error_code={ik_response.error_code.val}, "
                 f"group={self.sim_ik_group_name}, "
@@ -1323,6 +1771,7 @@ class MoveToCharucoPoseNode(Node):
         if missing_joints:
             return (
                 False,
+                None,
                 "IK response does not contain required joints: "
                 + ", ".join(missing_joints),
             )
@@ -1331,28 +1780,52 @@ class MoveToCharucoPoseNode(Node):
             float(solution_map[name]) for name in self.joint_names
         ]
 
-        trajectory_request = MoveJoint.Request()
-        trajectory_request.angles = target_positions
-        trajectory_request.mvtime = self.sim_cartesian_move_duration
-        trajectory_request.wait = True
-        trajectory_response = MoveJoint.Response()
+        self.get_logger().info(
+            "IK solution: solution_deg="
+            f"{[round(math.degrees(v), 1) for v in target_positions]}"
+        )
 
-        if self.get_effective_joint_backend() == "topic":
-            result = self.move_with_joint_trajectory_topic(
-                target_positions,
-                target_positions,
-                trajectory_request,
-                trajectory_response,
+        return True, target_positions, "success"
+
+    def move_with_sim_cartesian_pose(self, cartesian_pose, side="latest"):
+        """Convert a Cartesian target to joints with MoveIt IK, then use ros2_control."""
+        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
+            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
+
+        target_joint1 = None
+        if self.align_joint1_before_move:
+            current_positions = self.get_current_joint_positions()
+            target_joint1 = self.compute_target_joint1_rad(
+                cartesian_pose,
+                current_positions[0] if current_positions else None,
             )
-        else:
-            result = self.move_with_joint_trajectory(
-                target_positions,
-                target_positions,
-                trajectory_request,
-                trajectory_response,
-            )
-        if result.ret != FollowJointTrajectory.Result.SUCCESSFUL:
-            return False, result.message
+            if target_joint1 is None:
+                self.get_logger().warn(
+                    "The target is on the link_base Z axis, so the joint1 "
+                    "azimuth is undefined; skipping the alignment move."
+                )
+            else:
+                success, message = self.align_joint1_with_trajectory(
+                    target_joint1,
+                    side,
+                )
+                if not success:
+                    return False, f"joint1 alignment failed: {message}"
+
+        success, target_positions, message = self.request_ik_solution(
+            cartesian_pose,
+            side,
+            target_joint1,
+        )
+        if not success:
+            return False, message
+
+        success, message = self.execute_joint_positions(
+            target_positions,
+            self.sim_cartesian_move_duration,
+        )
+        if not success:
+            return False, message
 
         return (
             True,

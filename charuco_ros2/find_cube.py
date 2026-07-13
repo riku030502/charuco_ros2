@@ -49,6 +49,10 @@ class FindCubeNode(Node):
             "left_cube_color_link_base_frame",
         )
         self.declare_parameter("base_lookup_timeout", 0.02)
+        # base_y: base_frameでのY符号で左右を決める(+Y=ロボットの左、-Y=右)。
+        #         カメラの姿勢が変わっても左右が入れ替わらない。
+        # image_side: 画像の左右半分で決める(従来動作)。
+        self.declare_parameter("cube_side_mode", "base_y")
         self.declare_parameter("save_detected_pose", True)
         self.declare_parameter(
             "cube_pose_cache_file",
@@ -92,6 +96,9 @@ class FindCubeNode(Node):
             "base_left_child_frame"
         ).value
         self.base_lookup_timeout = self.get_parameter("base_lookup_timeout").value
+        self.cube_side_mode = self.get_parameter("cube_side_mode").value.lower()
+        if self.cube_side_mode not in ("base_y", "image_side"):
+            raise ValueError("cube_side_mode must be 'base_y' or 'image_side'")
         self.save_detected_pose = bool(
             self.get_parameter("save_detected_pose").value
         )
@@ -184,6 +191,14 @@ class FindCubeNode(Node):
         self.get_logger().info(f"publish_tf: {self.publish_tf}")
         self.get_logger().info(f"publish_base_tf: {self.publish_base_tf}")
         self.get_logger().info(f"base_frame: {self.base_frame}")
+        self.get_logger().info(
+            f"cube_side_mode: {self.cube_side_mode}"
+            + (
+                f" (+Y of {self.base_frame} = left, -Y = right)"
+                if self.cube_side_mode == "base_y"
+                else " (left/right half of the image)"
+            )
+        )
         self.get_logger().info(f"use_depth_distance: {self.use_depth_distance}")
         self.get_logger().info(
             f"fallback_to_size_distance: {self.fallback_to_size_distance}"
@@ -245,13 +260,14 @@ class FindCubeNode(Node):
         magenta_mask = self.make_magenta_mask(hsv)
 
         # マスク画像から「正方形フレームらしい」候補だけを抽出する。
-        # 両方ともマゼンタなので、色ではなく画像内の左右位置で分類する。
+        # 両方ともマゼンタなので、色では見分けられない。
         magenta_detections = self.find_frames(magenta_mask)
         # CameraInfo から fx が取得できていれば、各候補に distance_m を追加する。
         self.add_distances(magenta_detections)
-        left_detections, right_detections = self.split_detections_by_image_side(
+        left_detections, right_detections = self.split_detections_by_side(
             magenta_detections,
             frame.shape[1],
+            self.parent_frame or msg.header.frame_id,
         )
 
         if right_detections:
@@ -309,6 +325,64 @@ class FindCubeNode(Node):
         lower_magenta = np.array([135, 80, 50], dtype=np.uint8)
         upper_magenta = np.array([170, 255, 255], dtype=np.uint8)
         return cv2.inRange(hsv, lower_magenta, upper_magenta)
+
+    def split_detections_by_side(self, detections, image_width, parent_frame):
+        if self.cube_side_mode == "base_y":
+            split = self.split_detections_by_base_y(detections, parent_frame)
+            if split is not None:
+                return split
+
+            self.get_logger().warn(
+                "Falling back to image-side classification: no detection has a "
+                f"{self.base_frame} position yet (CameraInfo, depth, or the "
+                f"{self.base_frame} TF may be missing).",
+                throttle_duration_sec=2.0,
+            )
+
+        return self.split_detections_by_image_side(detections, image_width)
+
+    def split_detections_by_base_y(self, detections, parent_frame):
+        """base_frameでのY符号で左右を決める。+Yがロボットの左、-Yが右。
+
+        画像内の左右位置と違い、カメラが動いても同じキューブが同じ側のままになる。
+        base_frameの位置が1つも求まらない場合はNoneを返し、呼び出し側で従来の画像左右分類へフォールバックする。
+        """
+        if not detections or not self.base_frame or not parent_frame:
+            return None
+
+        try:
+            base_to_parent = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                parent_frame,
+                Time(),
+                timeout=Duration(seconds=float(self.base_lookup_timeout)),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+        left_detections = []
+        right_detections = []
+
+        for detection in detections:
+            position = detection.get("position")
+            if position is None:
+                continue
+
+            base_position = self.transform_point(
+                base_to_parent,
+                np.array(position, dtype=np.float64),
+            )
+            detection["base_position"] = base_position
+
+            if float(base_position[1]) >= 0.0:
+                left_detections.append(detection)
+            else:
+                right_detections.append(detection)
+
+        if not left_detections and not right_detections:
+            return None
+
+        return left_detections, right_detections
 
     def split_detections_by_image_side(self, detections, image_width):
         left_detections = []
