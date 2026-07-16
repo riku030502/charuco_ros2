@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 import cv2
+import json
 import numpy as np
+import os
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
 
 from cv_bridge import CvBridge
-from tf2_ros import TransformBroadcaster
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    StaticTransformBroadcaster,
+    TransformBroadcaster,
+    TransformListener,
+)
 
 from scipy.spatial.transform import Rotation as R
 
@@ -48,6 +60,28 @@ class MultiCharucoDetectorNode(Node):
         self.declare_parameter("allow_marker_only_pose", True)
         self.declare_parameter("min_markers_for_pose", 2)
 
+        # =========================
+        # World camera link TF
+        # =========================
+        # detect_charuco が検出・保存した world 基準のカメラリンクTFを、
+        # 起動時に読んで静的TFとして配信する。この辺が無いと world から
+        # left/right_camera_color_optical_frame へ辿れず、左右カメラの
+        # 点群を world 座標に変換できない。
+        #
+        #   world ──> link_base ──> ...          （robot_state_publisher）
+        #   world ──> left_camera_link ──> ...   （ここで配信）
+        self.declare_parameter("publish_world_camera_tf", True)
+        self.declare_parameter(
+            "world_tf_cache_file",
+            "charuco_ros2/config/world_camera_tfs.json",
+        )
+        self.declare_parameter("world_frame", "world")
+        self.declare_parameter("world_lookup_timeout", 0.05)
+        self.declare_parameter("publish_camera_link_from_cube_tf", True)
+        self.declare_parameter("save_camera_link_from_cube_tf", True)
+        self.declare_parameter("left_cube_camera_link_frame", "left_camera_link")
+        self.declare_parameter("right_cube_camera_link_frame", "right_camera_link")
+
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
@@ -65,6 +99,27 @@ class MultiCharucoDetectorNode(Node):
         self.min_markers_for_pose = int(
             self.get_parameter("min_markers_for_pose").value
         )
+
+        self.publish_world_camera_tf = bool(
+            self.get_parameter("publish_world_camera_tf").value
+        )
+        self.world_tf_cache_file = self.resolve_cache_file(
+            self.get_parameter("world_tf_cache_file").value
+        )
+        self.world_frame = self.get_parameter("world_frame").value
+        self.world_lookup_timeout = float(
+            self.get_parameter("world_lookup_timeout").value
+        )
+        self.publish_camera_link_from_cube_tf = bool(
+            self.get_parameter("publish_camera_link_from_cube_tf").value
+        )
+        self.save_camera_link_from_cube_tf = bool(
+            self.get_parameter("save_camera_link_from_cube_tf").value
+        )
+        self.cube_camera_link_frames = {
+            "left_cube": self.get_parameter("left_cube_camera_link_frame").value,
+            "right_cube": self.get_parameter("right_cube_camera_link_frame").value,
+        }
 
         # =========================
         # Board ID configs
@@ -177,10 +232,15 @@ class MultiCharucoDetectorNode(Node):
             },
         ]
 
-        # 各面ボード座標系からfront面ボード座標系への変換行列を計算して追加
+        T_camera_link_in_front = self._compute_T_camera_link_in_front()
+
+        # 各面ボード座標系からfront/camera_link相当への変換行列を計算して追加
         for config in self.board_id_configs:
             config["T_front_in_face"] = self._compute_T_front_in_face(
                 config["face_name"], self.cube_size
+            )
+            config["T_camera_link_in_face"] = (
+                config["T_front_in_face"] @ T_camera_link_in_front
             )
 
         # =========================
@@ -261,6 +321,13 @@ class MultiCharucoDetectorNode(Node):
         # =========================
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.saved_world_camera_transforms = {}
+
+        if self.publish_world_camera_tf:
+            self.publish_world_camera_transforms()
 
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
@@ -290,6 +357,15 @@ class MultiCharucoDetectorNode(Node):
         self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
         self.get_logger().info(f"square_length: {self.square_length} m")
         self.get_logger().info(f"marker_length: {self.marker_length} m")
+        self.get_logger().info(
+            f"publish_camera_link_from_cube_tf: "
+            f"{self.publish_camera_link_from_cube_tf}, "
+            f"cube_camera_link_frames: {self.cube_camera_link_frames}"
+        )
+        self.get_logger().info(
+            f"publish_world_camera_tf: {self.publish_world_camera_tf}, "
+            f"world_tf_cache_file: {self.world_tf_cache_file}"
+        )
 
         for entry in self.board_entries:
             config = entry["config"]
@@ -436,6 +512,8 @@ class MultiCharucoDetectorNode(Node):
             if result.get("pose_success", False)
         ]
 
+        self.publish_cube_transforms(msg, ok_boards)
+
         if ok_boards:
             board_text = ", ".join(
                 [
@@ -544,13 +622,6 @@ class MultiCharucoDetectorNode(Node):
             tvec=tvec,
         )
 
-        self.publish_cube_tf(
-            image_msg=image_msg,
-            config=config,
-            rvec=rvec,
-            tvec=tvec,
-        )
-
         self.draw_board_label(
             debug_frame=debug_frame,
             config=config,
@@ -565,10 +636,12 @@ class MultiCharucoDetectorNode(Node):
             "cube_name": config["cube_name"],
             "face_name": config["face_name"],
             "child_frame": config["child_frame"],
+            "config": config,
             "num_markers": num_markers,
             "num_corners": num_corners,
             "pose_success": True,
             "pose_source": pose_source,
+            "rvec": rvec,
             "tvec": tvec,
         }
 
@@ -765,31 +838,57 @@ class MultiCharucoDetectorNode(Node):
             )
 
     def publish_tf(self, image_msg: Image, child_frame: str, rvec, tvec):
-        transform = TransformStamped()
+        self.tf_broadcaster.sendTransform(
+            self.camera_transform_from_rt(image_msg, child_frame, rvec, tvec)
+        )
 
-        transform.header.stamp = image_msg.header.stamp
-
-        # 基本はImageのframe_idを使う方が安全
-        if image_msg.header.frame_id:
-            transform.header.frame_id = image_msg.header.frame_id
-        else:
-            transform.header.frame_id = self.parent_frame
-
-        transform.child_frame_id = child_frame
-
-        transform.transform.translation.x = float(tvec[0][0])
-        transform.transform.translation.y = float(tvec[1][0])
-        transform.transform.translation.z = float(tvec[2][0])
-
+    def camera_transform_from_rt(self, image_msg: Image, child_frame: str, rvec, tvec):
         rot_mat, _ = cv2.Rodrigues(rvec)
         quat = R.from_matrix(rot_mat).as_quat()  # x, y, z, w
+
+        # 基本はImageのframe_idを使う方が安全
+        parent_frame = image_msg.header.frame_id or self.parent_frame
+
+        return self.create_transform(
+            image_msg.header.stamp,
+            parent_frame,
+            child_frame,
+            tvec.flatten(),
+            quat,
+        )
+
+    def create_transform(self, stamp, parent_frame, child_frame, translation, quat):
+        transform = TransformStamped()
+
+        transform.header.stamp = stamp
+        transform.header.frame_id = parent_frame
+        transform.child_frame_id = child_frame
+
+        transform.transform.translation.x = float(translation[0])
+        transform.transform.translation.y = float(translation[1])
+        transform.transform.translation.z = float(translation[2])
 
         transform.transform.rotation.x = float(quat[0])
         transform.transform.rotation.y = float(quat[1])
         transform.transform.rotation.z = float(quat[2])
         transform.transform.rotation.w = float(quat[3])
 
-        self.tf_broadcaster.sendTransform(transform)
+        return transform
+
+    @staticmethod
+    def transform_to_pose(transform: TransformStamped):
+        translation = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ], dtype=np.float64)
+        rotation = R.from_quat([
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ])
+        return translation, rotation
 
     @staticmethod
     def _compute_T_front_in_face(face_name: str, L: float) -> np.ndarray:
@@ -802,9 +901,16 @@ class MultiCharucoDetectorNode(Node):
           - 全面でボードの-Y軸（上方向）がキューブ上方向（-Y_cube）を向く
             ただしtop面はボードの-Y軸がfront方向（-Z_cube）を向く
           - ボード原点は各面をキューブ外から見た時の「左上コーナー」
-          - ボードZ軸はsolvePnP規約に従いカメラ方向（面の外側）を向く
+          - 面間オフセットでは +X=右, +Y=下, +Z=奥 として扱う
 
-        面ごとの原点（キューブ座標）:
+        面ごとの回転はキューブ形状から決める。並進は実測した面間関係を使う。
+        実測したfront原点（各面ボード座標）:
+          top:   手前4.5 cm, 下0.5 cm
+          right: 手前0.3 cm, 左4.3 cm
+          left:  手前4.5 cm, 右0.5 cm
+          back:  手前5.0 cm, 左3.5 cm
+
+        参考: キューブ形状だけで置いた場合の面ごとの原点（キューブ座標）:
           front: (0,  0,  0)
           top:   (0,  0,  0)  ← front-left-top角を共有
           right: (L,  0,  0)
@@ -842,32 +948,366 @@ class MultiCharucoDetectorNode(Node):
 
         # front board frame → face board frame
         R_front_in_face = R_face_to_cube.T @ R_front_to_cube
-        t_front_in_face = R_face_to_cube.T @ (p_front - p_face)
+        geometric_t_front_in_face = R_face_to_cube.T @ (p_front - p_face)
+        t_front_in_face = MultiCharucoDetectorNode._front_translation_in_face(
+            face_name,
+            geometric_t_front_in_face,
+        )
 
         T = np.eye(4)
         T[:3, :3] = R_front_in_face
         T[:3,  3] = t_front_in_face
         return T
 
-    def publish_cube_tf(self, image_msg: Image, config: dict, rvec, tvec):
-        """検出した面のボード姿勢からfront面相当のTFを計算して発信する。"""
+    @staticmethod
+    def _front_translation_in_face(face_name: str, fallback: np.ndarray) -> np.ndarray:
+        """実測値からfront原点の位置を各面ボード座標で返す。
+
+        +X=右, +Y=下, +Z=奥。したがって「手前」は-Z。
+        """
+        measured_offsets = {
+            "front": np.array([0.0, 0.0, 0.0], dtype=float),
+            "top": np.array([0.0, 0.005, -0.045], dtype=float),
+            "right": np.array([-0.043, 0.0, -0.003], dtype=float),
+            "left": np.array([0.005, 0.0, -0.045], dtype=float),
+            "back": np.array([-0.035, 0.0, -0.050], dtype=float),
+        }
+        return measured_offsets.get(face_name, fallback)
+
+    @staticmethod
+    def _compute_T_camera_link_in_front() -> np.ndarray:
+        """front面ボード座標系からcube camera_link相当への変換を返す。
+
+        実測関係: front -> camera_link は 下7.0 cm, 右4.0 cm, 奥2.0 cm。
+        回転は現在のcamera_link軸を基準に、緑軸(+Y)まわり反時計回り90度、
+        続けて赤軸(+X)まわり時計回り90度、さらに赤軸(+X)まわり180度を
+        合成する。
+        """
+        T = np.eye(4)
+        angle = np.deg2rad(90.0)
+        c = float(np.cos(angle))
+        s = float(np.sin(angle))
+        R_y_ccw = np.array([
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ])
+        R_x_cw = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, c, s],
+            [0.0, -s, c],
+        ])
+        R_x_180 = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ])
+        T[:3, :3] = R_y_ccw @ R_x_cw @ R_x_180
+        T[:3, 3] = np.array([0.040, 0.070, 0.020], dtype=float)
+        return T
+
+    def publish_cube_transforms(self, image_msg: Image, ok_boards: list):
+        """検出できた面からキューブTFを発信し、キャッシュを更新する。
+
+        同じキューブの複数面が同時に見えることがあるので、最も信頼できる
+        1面だけを使ってキューブごとに1つのTFを出す。
+        """
+        best_by_cube = {}
+
+        for result in ok_boards:
+            cube_frame = result["config"]["cube_frame"]
+            current = best_by_cube.get(cube_frame)
+
+            if (
+                current is None
+                or self.pose_quality(result) > self.pose_quality(current)
+            ):
+                best_by_cube[cube_frame] = result
+
+        transforms = []
+        camera_link_transforms = []
+
+        for cube_frame, result in best_by_cube.items():
+            config = result["config"]
+            front_frame = self.front_frame_for_cube(cube_frame)
+            camera_link_frame = self.cube_camera_link_frames.get(cube_frame)
+
+            if not camera_link_frame:
+                continue
+
+            rvec_camera_link, t_camera_link = self.pose_in_camera_from_face(
+                config,
+                result["rvec"],
+                result["tvec"],
+                config["T_camera_link_in_face"],
+            )
+
+            transforms.append(
+                self.transform_from_matrix(
+                    image_msg.header.stamp,
+                    config["child_frame"],
+                    front_frame,
+                    config["T_front_in_face"],
+                )
+            )
+
+            camera_transform = self.camera_transform_from_rt(
+                image_msg,
+                camera_link_frame,
+                rvec_camera_link,
+                t_camera_link,
+            )
+
+            world_transform = self.to_world_frame(camera_transform)
+            if world_transform is None:
+                continue
+
+            camera_link_transforms.append(world_transform)
+
+        if transforms:
+            self.tf_broadcaster.sendTransform(transforms)
+
+        if camera_link_transforms:
+            if self.publish_camera_link_from_cube_tf:
+                self.static_tf_broadcaster.sendTransform(camera_link_transforms)
+            self.save_world_camera_transforms(camera_link_transforms)
+
+    def front_frame_for_cube(self, cube_frame: str):
+        return f"{cube_frame}_front"
+
+    def transform_from_matrix(
+        self,
+        stamp,
+        parent_frame: str,
+        child_frame: str,
+        transform_matrix: np.ndarray,
+    ):
+        return self.create_transform(
+            stamp,
+            parent_frame,
+            child_frame,
+            transform_matrix[:3, 3],
+            R.from_matrix(transform_matrix[:3, :3]).as_quat(),
+        )
+
+    @staticmethod
+    def pose_quality(result: dict):
+        """ChArUcoコーナー解を優先し、次にコーナー数・マーカー数で比べる。"""
+        return (
+            1 if result.get("pose_source") == "chessboard" else 0,
+            result.get("num_corners", 0),
+            result.get("num_markers", 0),
+        )
+
+    def cube_target_pose_in_camera(self, config: dict, rvec, tvec):
+        """検出した面の姿勢からcube camera_link相当の姿勢を計算する。"""
+        return self.pose_in_camera_from_face(
+            config,
+            rvec,
+            tvec,
+            config["T_camera_link_in_face"],
+        )
+
+    def pose_in_camera_from_face(
+        self,
+        config: dict,
+        rvec,
+        tvec,
+        target_in_face: np.ndarray,
+    ):
+        """検出した面の姿勢から任意の面内ターゲット姿勢を計算する。"""
         R_face, _ = cv2.Rodrigues(rvec)
         T_face_in_cam = np.eye(4)
         T_face_in_cam[:3, :3] = R_face
         T_face_in_cam[:3,  3] = tvec.flatten()
 
-        T_front_in_cam = T_face_in_cam @ config["T_front_in_face"]
+        T_target_in_cam = T_face_in_cam @ target_in_face
 
-        R_front = T_front_in_cam[:3, :3]
-        t_front = T_front_in_cam[:3, 3].reshape(3, 1)
-        rvec_front, _ = cv2.Rodrigues(R_front)
+        R_target = T_target_in_cam[:3, :3]
+        t_target = T_target_in_cam[:3, 3].reshape(3, 1)
+        rvec_target, _ = cv2.Rodrigues(R_target)
 
-        self.publish_tf(
-            image_msg=image_msg,
-            child_frame=config["cube_frame"],
-            rvec=rvec_front,
-            tvec=t_front,
+        return rvec_target, t_target
+
+    def to_world_frame(self, camera_transform: TransformStamped):
+        """画像フレーム基準のcamera_link TFを world_frame 基準に直す。"""
+        try:
+            world_to_camera = self.tf_buffer.lookup_transform(
+                self.world_frame,
+                camera_transform.header.frame_id,
+                Time(),
+                timeout=Duration(seconds=self.world_lookup_timeout),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(
+                f"Camera link TF not updated; lookup failed: {self.world_frame} -> "
+                f"{camera_transform.header.frame_id}: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        world_t_camera, world_r_camera = self.transform_to_pose(world_to_camera)
+        camera_t_link, camera_r_link = self.transform_to_pose(camera_transform)
+
+        world_t_link = world_t_camera + world_r_camera.apply(camera_t_link)
+        world_r_link = world_r_camera * camera_r_link
+
+        return self.create_transform(
+            camera_transform.header.stamp,
+            self.world_frame,
+            camera_transform.child_frame_id,
+            world_t_link,
+            world_r_link.as_quat(),
         )
+
+    def resolve_cache_file(self, cache_file):
+        if os.path.isabs(cache_file):
+            return os.path.realpath(os.path.expanduser(cache_file))
+
+        package_relative_prefix = "charuco_ros2/"
+        if cache_file.startswith(package_relative_prefix):
+            cache_file = cache_file[len(package_relative_prefix):]
+
+        return os.path.realpath(
+            os.path.join(os.path.dirname(__file__), "..", cache_file)
+        )
+
+    def publish_world_camera_transforms(self):
+        """保存済みのworld基準カメラリンクTFを静的TFとして配信する。
+
+        値は detect_charuco が検出して world_tf_cache_file に保存したもの。
+        multi_cube_charuco_detector は検出したcube姿勢から、この回転を更新する。
+        """
+        transforms = self.load_world_camera_transforms()
+
+        if not transforms:
+            self.get_logger().warn(
+                f"No world camera link TF published from "
+                f"{self.world_tf_cache_file}; point clouds from the left/right "
+                f"cameras cannot be transformed into {self.world_frame}. "
+                f"Run detect_charuco once to detect and save the camera poses."
+            )
+            return
+
+        self.static_tf_broadcaster.sendTransform(transforms)
+
+        for transform in transforms:
+            self.get_logger().info(
+                f"published static TF: {transform.header.frame_id} -> "
+                f"{transform.child_frame_id}"
+            )
+
+    def load_world_camera_transforms(self):
+        if not os.path.exists(self.world_tf_cache_file):
+            self.get_logger().warn(
+                f"World camera TF cache not found: {self.world_tf_cache_file}"
+            )
+            return []
+
+        try:
+            with open(self.world_tf_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.get_logger().warn(
+                f"Failed to load world camera TF cache "
+                f"{self.world_tf_cache_file}: {e}"
+            )
+            return []
+
+        cached_transforms = data.get("transforms", {})
+        if not isinstance(cached_transforms, dict):
+            self.get_logger().warn(
+                f"World camera TF cache has invalid format: "
+                f"{self.world_tf_cache_file}"
+            )
+            return []
+
+        stamp = self.get_clock().now().to_msg()
+
+        transforms = []
+        for child_frame_id, value in cached_transforms.items():
+            try:
+                transform = self.create_transform(
+                    stamp,
+                    value.get("parent_frame", self.world_frame),
+                    child_frame_id,
+                    self.xyz_from_dict(value["translation"]),
+                    self.xyzw_from_dict(value["rotation"]),
+                )
+                transforms.append(transform)
+                self.saved_world_camera_transforms[child_frame_id] = transform
+            except (KeyError, TypeError, ValueError) as e:
+                self.get_logger().warn(
+                    f"Skipping invalid world camera TF for {child_frame_id}: {e}"
+                )
+
+        return transforms
+
+    def save_world_camera_transforms(self, transforms):
+        if not transforms:
+            return
+
+        for transform in transforms:
+            self.saved_world_camera_transforms[transform.child_frame_id] = transform
+
+        if not self.save_camera_link_from_cube_tf:
+            return
+
+        data = {
+            "world_frame": self.world_frame,
+            "transforms": {
+                child_frame_id: self.transform_to_cache(saved_transform)
+                for child_frame_id, saved_transform
+                in self.saved_world_camera_transforms.items()
+            },
+        }
+
+        cache_dir = os.path.dirname(self.world_tf_cache_file)
+        try:
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+
+            tmp_file = f"{self.world_tf_cache_file}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_file, self.world_tf_cache_file)
+        except OSError as e:
+            self.get_logger().warn(
+                f"Failed to save world camera TF cache "
+                f"{self.world_tf_cache_file}: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        child_frames = ", ".join(transform.child_frame_id for transform in transforms)
+        self.get_logger().info(
+            f"Saved camera link TF(s) from cube pose: {child_frames}",
+            throttle_duration_sec=2.0,
+        )
+
+    def transform_to_cache(self, transform: TransformStamped):
+        return {
+            "parent_frame": transform.header.frame_id,
+            "translation": self.xyz_to_dict(transform.transform.translation),
+            "rotation": self.xyzw_to_dict(transform.transform.rotation),
+        }
+
+    @staticmethod
+    def xyz_to_dict(value):
+        return {"x": value.x, "y": value.y, "z": value.z}
+
+    @staticmethod
+    def xyzw_to_dict(value):
+        return {"x": value.x, "y": value.y, "z": value.z, "w": value.w}
+
+    @staticmethod
+    def xyz_from_dict(value):
+        return [float(value[key]) for key in ("x", "y", "z")]
+
+    @staticmethod
+    def xyzw_from_dict(value):
+        return [float(value[key]) for key in ("x", "y", "z", "w")]
 
     def publish_debug_image(self, frame, header):
         try:
