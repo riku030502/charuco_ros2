@@ -3,5 +3,15 @@
 *.pdf
 __pycache__/
 
-# move_to_charucoが実行のたびに上書きする生成キャッシュ
+# 生成ボード画像/設定
+charuco_ros2/boards/generated/
+
+# 実行のたびに上書きされるTF/姿勢キャッシュ
 config/cube_target_poses.yaml
+config/*_tfs.json
+
+# 検証ログ/ROS bag
+*.csv
+*.db3
+*.bag
+*.log
