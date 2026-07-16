@@ -5,15 +5,21 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
 
+from charuco_ros2.charuco_board_utils import (
+    CUBE_CHARUCO_DEFAULTS,
+    get_aruco_dictionary,
+    m_to_mm,
+)
+
 
 # =========================
 # ChArUco board parameters
 # =========================
-squares_x = 4          # 横方向のマス数
-squares_y = 4          # 縦方向のマス数
+squares_x = CUBE_CHARUCO_DEFAULTS["squares_x"]  # 横方向のマス数
+squares_y = CUBE_CHARUCO_DEFAULTS["squares_y"]  # 縦方向のマス数
 
-square_length_mm = 10  # 1マス 10 mm
-marker_length_mm = 7   # マーカ部分 7 mm
+square_length_mm = int(m_to_mm(CUBE_CHARUCO_DEFAULTS["square_length_m"]))
+marker_length_mm = int(m_to_mm(CUBE_CHARUCO_DEFAULTS["marker_length_m"]))
 
 # 印刷解像度
 dpi = 300
@@ -42,7 +48,7 @@ output_dir = Path("boards/generated/cube_charuco_sheets")
 
 # ArUco dictionary
 # 今回は 10面 × 8ID = 80 ID 必要なので DICT_4X4_100 で足りる
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
+aruco_dict = get_aruco_dictionary(CUBE_CHARUCO_DEFAULTS["dictionary"])
 
 # 面の並び
 face_names = ["front", "left", "right", "back", "top"]

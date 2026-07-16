@@ -13,7 +13,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (
+            os.path.join('share', package_name, 'launch'),
+            glob('launch/*.launch.py'),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,7 +31,22 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'multi_cube_charuco_detector = charuco_ros2.multi_cube_charuco_detector:main',
+            (
+                'multi_cube_charuco_detector = '
+                'charuco_ros2.multi_cube_charuco_detector:main'
+            ),
+            (
+                'generate_validation_charuco_board = '
+                'charuco_ros2.generate_validation_charuco_board:main'
+            ),
+            (
+                'charuco_target_detector = '
+                'charuco_ros2.charuco_target_detector:main'
+            ),
+            (
+                'charuco_pose_comparator = '
+                'charuco_ros2.charuco_pose_comparator:main'
+            ),
             'generate_charuco_5_7 = charuco_ros2.generate_charuco_5_7:main',
             'detect_charuco = charuco_ros2.detect_charuco:main',
             'detect_charuco_9_7 = charuco_ros2.detect_charuco_9_7:main',

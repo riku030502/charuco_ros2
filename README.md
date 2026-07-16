@@ -212,6 +212,57 @@ ros2 launch realsense2_camera rs_launch.py \
 | `allow_marker_only_pose` | `true` | マーカーの角へフォールバックする |
 | `min_markers_for_pose` | `2` | フォールバックに必要なマーカー数 |
 
+## ハンドカメラ仲介の外部カメラ検証
+
+外部カメラと校正済みハンドカメラから同じ検証用ChArUcoボードを観測し、
+それぞれの `base_link -> target` を比較する暫定チェック用ノード群。
+
+検証用ボードを生成する。既定値は既存キューブと同じ
+4x4 / square 10 mm / marker 7 mm / `DICT_4X4_100` で、既存キューブの
+ID `0-79` と衝突しないように `80-87` を使う。
+
+```bash
+ros2 run charuco_ros2 generate_validation_charuco_board
+```
+
+生成物は既定で `boards/generated/validation_charuco/` に保存される。
+PNG/PDFを印刷し、同時に出るYAMLまたはJSONを検出ノードの
+`board_config_path` に渡す。
+
+単体検出ノード:
+
+```bash
+ros2 run charuco_ros2 charuco_target_detector --ros-args \
+  -p image_topic:=/left_camera/color/image_raw \
+  -p camera_info_topic:=/left_camera/color/camera_info \
+  -p board_config_path:=boards/generated/validation_charuco/validation_charuco_4x4_square10mm_marker7mm_id80-87_300dpi.yaml \
+  -p output_frame_id:=target_pose_ext_left \
+  -p pose_topic:=/charuco_validation/ext_pose
+```
+
+検出ノードは `camera_optical_frame -> output_frame_id` のTFと、
+同じ姿勢の `geometry_msgs/PoseStamped` をpublishする。
+
+外部カメラ検出、ハンドカメラ検出、比較ノードをまとめて起動する例:
+
+```bash
+ros2 launch charuco_ros2 charuco_target_validation.launch.py \
+  board_config_path:=boards/generated/validation_charuco/validation_charuco_4x4_square10mm_marker7mm_id80-87_300dpi.yaml \
+  ext_image_topic:=/left_camera/color/image_raw \
+  ext_camera_info_topic:=/left_camera/color/camera_info \
+  ext_output_frame_id:=target_pose_ext_left \
+  hand_image_topic:=/camera/hand_camera/color/image_raw \
+  hand_camera_info_topic:=/camera/hand_camera/color/camera_info \
+  hand_output_frame_id:=target_pose_hand \
+  base_frame:=base_link \
+  csv_path:=/tmp/charuco_validation_left.csv
+```
+
+比較ノードは `base_frame -> target_pose_ext_left` と
+`base_frame -> target_pose_hand` をtf2でlookupし、並進誤差[mm]と
+回転誤差[deg]をログ出力する。`csv_path` を指定すると表IIの集計に使える
+CSVを追記する。
+
 ## キューブへの移動（`move_to_charuco`）
 
 検出したキューブの手前の待機姿勢へ、xArm6を移動させる。

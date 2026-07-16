@@ -25,6 +25,11 @@ from tf2_ros import (
 
 from scipy.spatial.transform import Rotation as R
 
+from charuco_ros2.charuco_board_utils import (
+    CUBE_CHARUCO_DEFAULTS,
+    get_aruco_dictionary,
+)
+
 
 class MultiCharucoDetectorNode(Node):
     def __init__(self):
@@ -43,10 +48,16 @@ class MultiCharucoDetectorNode(Node):
         # ChArUco board parameters
         # =========================
         # 生成コードと必ず合わせる
-        self.declare_parameter("squares_x", 4)
-        self.declare_parameter("squares_y", 4)
-        self.declare_parameter("square_length", 0.010)  # [m]
-        self.declare_parameter("marker_length", 0.007)  # [m]
+        self.declare_parameter("squares_x", CUBE_CHARUCO_DEFAULTS["squares_x"])
+        self.declare_parameter("squares_y", CUBE_CHARUCO_DEFAULTS["squares_y"])
+        self.declare_parameter(
+            "square_length",
+            CUBE_CHARUCO_DEFAULTS["square_length_m"],
+        )
+        self.declare_parameter(
+            "marker_length",
+            CUBE_CHARUCO_DEFAULTS["marker_length_m"],
+        )
         self.declare_parameter("cube_size", 0.050)  # [m] キューブ一辺の長さ
 
         # =========================
@@ -247,8 +258,8 @@ class MultiCharucoDetectorNode(Node):
         # ArUco dictionary
         # =========================
         # 生成コード側が ID 0-79 を使うため DICT_4X4_100 にする
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(
-            cv2.aruco.DICT_4X4_100
+        self.aruco_dict = get_aruco_dictionary(
+            CUBE_CHARUCO_DEFAULTS["dictionary"]
         )
 
         # =========================
@@ -542,7 +553,6 @@ class MultiCharucoDetectorNode(Node):
         """1つのboard configについて検出と姿勢推定を試す。"""
 
         config = entry["config"]
-        board = entry["board"]
         charuco_detector = entry["charuco_detector"]
 
         # =========================
