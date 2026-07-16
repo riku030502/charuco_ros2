@@ -20,6 +20,8 @@
     - 回転: ChArUcoフレームから `z=90 deg` → `x=90 deg` → `y=180 deg`
 - `multi_cube_charuco_detector.py`
   - 2個のキューブそれぞれの5面を検出する。詳細は後述。
+  - 検出した多面ChArUcoから `left_camera_link` / `right_camera_link` を推定し、
+    `world_camera_tfs.json` を更新する。
 - `generate_charuco_5_7.py`
   - 現行の7x5 ChArUcoボード2枚のジェネレータ。
     - `left_camera_charuco`, マーカーID `0-16`
@@ -116,12 +118,45 @@ ros2 run charuco_ros2 apriltag_detector
 
 ## マルチキューブ検出器（`multi_cube_charuco_detector`）
 
-50 mmキューブ2個について、それぞれ5面のChArUcoを検出し、面ごとのTFと
-`left_cube` / `right_cube` フレームを配信する。
+50 mmキューブ2個について、それぞれ5面のChArUcoを検出し、
+`left_camera_link` / `right_camera_link` を更新する。
 
 ```bash
 ros2 run charuco_ros2 multi_cube_charuco_detector
 ```
+
+### 配信するTF
+
+- 面のTF `*_charuco`（例: `left_cube_front_charuco`）
+  - カメラ光学フレーム基準の生の観測。検出できたフレームだけ配信する。
+- front補助TF `left_cube_front` / `right_cube_front`
+  - 検出した面の左角TFからfront面へ変換したデバッグ用TF。
+  - front面からcamera_linkへの実測オフセットを合成する。cube_link と
+    camera_link は平行なので、front -> camera_link は計算上は並進だけを使う。
+- camera_link TF `left_camera_link` / `right_camera_link`
+  - 起動時は `world_camera_tfs.json` の保存値を配信する。
+  - ChArUco検出時は、検出面 -> front -> camera_link で求めた
+    `world -> *_camera_link` を再配信し、`world_camera_tfs.json` に保存する。
+  - 同じキューブの複数面が同時に見えたときは、最も信頼できる1面だけを使う。
+    ChArUcoコーナー解を優先し、次にコーナー数・マーカー数で選ぶ。
+
+### world基準のカメラリンクTFも配信する
+
+起動時に `world_camera_tfs.json`（`detect_charuco` が検出・保存したもの）を読み、
+`world -> left_camera_link` / `world -> right_camera_link` を**静的TF**として
+配信する。これが無いと `world` から `left_camera_color_optical_frame` へ辿る辺が
+誰も配信しておらず、左右カメラの**点群をworld座標に変換できない**。
+
+```
+world ──> link_base ──> ...            robot_state_publisher（xarmのURDF）
+world ──> left_camera_link ──> ...     このノード（またはdetect_charuco）
+```
+
+- 既定のキャッシュ: `charuco_ros2/config/world_camera_tfs.json`
+- 起動時は保存値を読む。cubeを検出したら、対応するcamera_linkのTFを
+  再計算して再配信し、既定では `world_camera_tfs.json` に保存する。
+- `detect_charuco` と同時に起動する場合は、同じ辺を二重に配信することに
+  なるので `publish_world_camera_tf:=false` にする。
 
 ### 検出の律速はカメラの解像度
 

@@ -36,6 +36,7 @@ setup(
             'move_to_charuco = charuco_ros2.move_to_charuco:main',
             'sweep_cube_targets = charuco_ros2.sweep_cube_targets:main',
             'find_cube = charuco_ros2.find_cube:main',
+            'check_cloud_tilt = charuco_ros2.check_cloud_tilt:main',
         ],
     },
 )
