@@ -7,7 +7,6 @@ import time
 import numpy as np
 import yaml
 import rclpy
-from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
 
 try:
@@ -16,7 +15,14 @@ try:
 except ImportError:
     MoveItErrorCodes = None
     GetPositionIK = None
-from rclpy.action import ActionClient
+
+try:
+    from xarm_utils_py import XArmUtils
+    from xarm_utils_py import Node as XArmNode
+except ImportError:
+    XArmUtils = None
+    XArmNode = None
+
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -25,7 +31,7 @@ from rclpy.time import Time
 
 from sensor_msgs.msg import JointState
 from scipy.spatial.transform import Rotation as R
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import (
     Buffer,
     ConnectivityException,
@@ -33,17 +39,15 @@ from tf2_ros import (
     LookupException,
     TransformListener,
 )
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from xarm_msgs.srv import MoveCartesian, MoveJoint, SetInt16, SetInt16ById
+from xarm_msgs.srv import MoveJoint
 
 
 RIGHT_JOINT_DEGREES = [-53.0, 55.0, -110.0, 0.0, -52.0, -8.0]
 LEFT_JOINT_DEGREES = [53.0, 55.0, -110.0, 0.0, -62.0, -8.0]
 DEFAULT_JOINT_DEGREES = LEFT_JOINT_DEGREES
+PRE_MARKER_JOINT_DEGREES = [0.0, -15.0, 0.0, 0.0, -90.0, 0.0]
 DEFAULT_SPEED = 0.035  # 0.1x of the xArm README example 0.35 rad/s
 DEFAULT_ACC = 1.0  # 0.1x of the xArm README example 10 rad/s^2
-MOVE_JOINT_TYPE = "xarm_msgs/srv/MoveJoint"
-MOVE_CARTESIAN_TYPE = "xarm_msgs/srv/MoveCartesian"
 JOINT1_LIMIT_RAD = 2.0 * math.pi
 
 
@@ -53,7 +57,10 @@ class MoveToCharucoPoseNode(Node):
 
         self.declare_parameter("server_service_name", "/move_to_charuco")
         self.declare_parameter("execution_mode", "real")
-        self.declare_parameter("backend", "auto")
+        self.declare_parameter("backend", "moveit")
+        self.declare_parameter("move_group_name", "xarm6")
+        self.declare_parameter("moveit_planning_pipeline", "")
+        self.declare_parameter("move_group_ready_timeout", 10.0)
         self.declare_parameter("xarm_service_name", "auto")
         self.declare_parameter("controller_name", "xarm6_traj_controller")
         self.declare_parameter("joint_prefix", "")
@@ -71,6 +78,27 @@ class MoveToCharucoPoseNode(Node):
         self.declare_parameter("camera_side", "left")
         self.declare_parameter("left_joint_degrees", LEFT_JOINT_DEGREES)
         self.declare_parameter("right_joint_degrees", RIGHT_JOINT_DEGREES)
+        self.declare_parameter("prepare_before_marker_move", True)
+        self.declare_parameter(
+            "pre_marker_joint_degrees",
+            PRE_MARKER_JOINT_DEGREES,
+        )
+        self.declare_parameter("pre_marker_detection_window_sec", 0.0)
+        self.declare_parameter("manage_find_cube_detection", True)
+        self.declare_parameter(
+            "find_cube_detection_service_name",
+            "/find_cube/set_detection_enabled",
+        )
+        self.declare_parameter("find_cube_detection_service_timeout", 2.0)
+        self.declare_parameter("restore_find_cube_detection_after_move", False)
+        self.declare_parameter("detect_multi_cube_after_approach", True)
+        self.declare_parameter(
+            "multi_cube_detect_service_name",
+            "/multi_cube_charuco_detector/detect_once",
+        )
+        self.declare_parameter("multi_cube_detect_service_timeout", 8.0)
+        self.declare_parameter("multi_cube_detect_required", True)
+        self.declare_parameter("return_to_pre_marker_after_success", True)
         self.declare_parameter("cube_base_frame", "link_base")
         self.declare_parameter(
             "left_cube_tf_frame",
@@ -134,11 +162,8 @@ class MoveToCharucoPoseNode(Node):
         self.declare_parameter("prepare_xarm_before_cartesian", True)
         self.declare_parameter("cartesian_mode", 0)
         self.declare_parameter("cartesian_state", 0)
-        # realでもsimと同じ経路を通す。
-        # falseだとxArmの set_position を使うが、その場合IKを解くのはMoveItでは
-        # なくxArmのファームウェアであり、選ばれる分岐も経路生成もsimと一致
-        # しない。simで確認した動きをそのまま実機で再現したいならtrueにする。
-        # /compute_ik が無い場合は set_position へフォールバックする。
+        # 後方互換のため残しているが、現在はreal/simともMoveIt IK -> MoveGroup
+        # plan/executeに固定する。xArmのset_positionへはフォールバックしない。
         self.declare_parameter("real_use_moveit_ik", True)
         self.declare_parameter("sim_ik_service_name", "/compute_ik")
         self.declare_parameter("sim_ik_group_name", "xarm6")
@@ -161,6 +186,13 @@ class MoveToCharucoPoseNode(Node):
         self.server_service_name = self.get_parameter("server_service_name").value
         self.execution_mode = self.get_parameter("execution_mode").value.lower()
         self.backend = self.get_parameter("backend").value.lower()
+        self.move_group_name = self.get_parameter("move_group_name").value
+        self.moveit_planning_pipeline = self.get_parameter(
+            "moveit_planning_pipeline"
+        ).value
+        self.move_group_ready_timeout = float(
+            self.get_parameter("move_group_ready_timeout").value
+        )
         self.xarm_service_name = self.get_parameter("xarm_service_name").value
         self.controller_name = self.get_parameter("controller_name").value
         self.joint_prefix = self.get_parameter("joint_prefix").value
@@ -186,6 +218,42 @@ class MoveToCharucoPoseNode(Node):
         self.camera_side = self.get_parameter("camera_side").value.lower()
         self.left_joint_degrees = list(self.get_parameter("left_joint_degrees").value)
         self.right_joint_degrees = list(self.get_parameter("right_joint_degrees").value)
+        self.prepare_before_marker_move = bool(
+            self.get_parameter("prepare_before_marker_move").value
+        )
+        self.pre_marker_joint_degrees = list(
+            self.get_parameter("pre_marker_joint_degrees").value
+        )
+        self.pre_marker_detection_window_sec = float(
+            self.get_parameter("pre_marker_detection_window_sec").value
+        )
+        self.manage_find_cube_detection = bool(
+            self.get_parameter("manage_find_cube_detection").value
+        )
+        self.find_cube_detection_service_name = self.get_parameter(
+            "find_cube_detection_service_name"
+        ).value
+        self.find_cube_detection_service_timeout = float(
+            self.get_parameter("find_cube_detection_service_timeout").value
+        )
+        self.restore_find_cube_detection_after_move = bool(
+            self.get_parameter("restore_find_cube_detection_after_move").value
+        )
+        self.detect_multi_cube_after_approach = bool(
+            self.get_parameter("detect_multi_cube_after_approach").value
+        )
+        self.multi_cube_detect_service_name = self.get_parameter(
+            "multi_cube_detect_service_name"
+        ).value
+        self.multi_cube_detect_service_timeout = float(
+            self.get_parameter("multi_cube_detect_service_timeout").value
+        )
+        self.multi_cube_detect_required = bool(
+            self.get_parameter("multi_cube_detect_required").value
+        )
+        self.return_to_pre_marker_after_success = bool(
+            self.get_parameter("return_to_pre_marker_after_success").value
+        )
         self.cube_base_frame = self.get_parameter("cube_base_frame").value
         self.left_cube_tf_frame = self.get_parameter("left_cube_tf_frame").value
         self.right_cube_tf_frame = self.get_parameter("right_cube_tf_frame").value
@@ -297,12 +365,24 @@ class MoveToCharucoPoseNode(Node):
         if self.execution_mode not in ("real", "sim"):
             raise ValueError("execution_mode must be 'real' or 'sim'")
 
-        if self.backend not in ("auto", "xarm_api", "trajectory", "topic"):
+        valid_backends = (
+            "auto",
+            "moveit",
+            "xarm_api",
+            "trajectory",
+            "topic",
+        )
+        if self.backend not in valid_backends:
             raise ValueError(
-                "backend must be 'auto', 'xarm_api', 'trajectory', or 'topic'"
+                "backend must be 'auto', 'moveit', 'xarm_api', 'trajectory', "
+                "or 'topic'"
             )
         if self.input_unit not in ("deg", "rad"):
             raise ValueError("input_unit must be 'deg' or 'rad'")
+        if len(self.pre_marker_joint_degrees) != 6:
+            raise ValueError("pre_marker_joint_degrees must contain 6 values")
+        if self.pre_marker_detection_window_sec < 0.0:
+            raise ValueError("pre_marker_detection_window_sec must be >= 0")
         if self.cartesian_max_target_distance_m <= 0.0:
             raise ValueError(
                 "cartesian_max_target_distance_m must be positive"
@@ -339,31 +419,16 @@ class MoveToCharucoPoseNode(Node):
             )
 
         self.callback_group = ReentrantCallbackGroup()
-        self.resolved_xarm_service_name = None
-        self.xarm_client = None
-        self.resolved_cartesian_service_name = None
-        self.cartesian_client = None
+        self.xarm_node = None
+        self.xarm = None
         self.sim_ik_client = None
+        self.find_cube_detection_client = None
+        self.multi_cube_detect_client = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.joint_names = [
             f"{self.joint_prefix}joint{i}" for i in range(1, 7)
         ]
-        self.trajectory_topic = f"/{self.controller_name}/joint_trajectory"
-        self.trajectory_action_name = (
-            f"/{self.controller_name}/follow_joint_trajectory"
-        )
-        self.trajectory_action_client = ActionClient(
-            self,
-            FollowJointTrajectory,
-            self.trajectory_action_name,
-            callback_group=self.callback_group,
-        )
-        self.trajectory_publisher = self.create_publisher(
-            JointTrajectory,
-            self.trajectory_topic,
-            10,
-        )
         self.latest_joint_state = None
         self.latest_joint_state_event = threading.Event()
         self.joint_state_subscription = self.create_subscription(
@@ -419,13 +484,33 @@ class MoveToCharucoPoseNode(Node):
             f"execution_mode={self.execution_mode}, "
             f"backend={self.backend} "
             f"(effective={self.get_effective_joint_backend()}), "
-            f"xarm_service={self.xarm_service_name}, "
-            f"trajectory_topic={self.trajectory_topic}, "
-            f"trajectory_action={self.trajectory_action_name}"
+            f"move_group={self.move_group_name}, "
+            f"planning_pipeline={self.moveit_planning_pipeline or 'default'}"
         )
         self.get_logger().info(
             f"left pose:  {self.left_joint_degrees} deg\n"
             f"right pose: {self.right_joint_degrees} deg"
+        )
+        self.get_logger().info(
+            "pre-marker move: "
+            f"enabled={self.prepare_before_marker_move}, "
+            f"return_after_success={self.return_to_pre_marker_after_success}, "
+            f"detection_window={self.pre_marker_detection_window_sec:.1f}s, "
+            f"pose={self.pre_marker_joint_degrees} deg"
+        )
+        self.get_logger().info(
+            "find_cube detection control: "
+            f"manage={self.manage_find_cube_detection}, "
+            f"service={self.find_cube_detection_service_name}, "
+            f"timeout={self.find_cube_detection_service_timeout:.1f}s, "
+            f"restore_after_move={self.restore_find_cube_detection_after_move}"
+        )
+        self.get_logger().info(
+            "multi-cube detection after approach: "
+            f"enabled={self.detect_multi_cube_after_approach}, "
+            f"required={self.multi_cube_detect_required}, "
+            f"service={self.multi_cube_detect_service_name}, "
+            f"timeout={self.multi_cube_detect_service_timeout:.1f}s"
         )
         self.get_logger().info(
             "Cartesian orientation: "
@@ -439,19 +524,18 @@ class MoveToCharucoPoseNode(Node):
         self.get_logger().info(
             f"IK seed mode: {self.sim_ik_seed_mode}"
         )
-        if self.execution_mode == "real":
-            if self.real_use_moveit_ik:
-                self.get_logger().info(
-                    "Cartesian moves use MoveIt IK -> set_servo_angle, "
-                    "so the motion matches execution_mode:=sim"
-                )
-            else:
-                self.get_logger().warn(
-                    "real_use_moveit_ik is false: Cartesian moves use the xArm "
-                    "set_position service, which solves the IK and plans the "
-                    "motion inside the xArm firmware. The motion will NOT "
-                    "match execution_mode:=sim."
-                )
+        if self.backend in ("topic", "trajectory", "xarm_api"):
+            self.get_logger().warn(
+                f"backend:={self.backend} is deprecated and ignored for "
+                "execution. move_to_charuco now always uses MoveIt "
+                "MoveGroup plan -> execute."
+            )
+        if self.execution_mode == "real" and not self.real_use_moveit_ik:
+            self.get_logger().warn(
+                "real_use_moveit_ik:=false is deprecated and ignored. "
+                "Cartesian moves still use MoveIt IK followed by MoveGroup "
+                "plan -> execute; xArm set_position fallback is disabled."
+            )
         self.get_logger().info(
             "joint1 alignment before Cartesian moves: "
             f"{self.align_joint1_before_move} "
@@ -487,93 +571,51 @@ class MoveToCharucoPoseNode(Node):
         )
 
     def get_effective_joint_backend(self):
-        """Resolve the actual joint command path for the selected environment."""
-        if self.backend != "auto":
-            return self.backend
-        if self.execution_mode == "real":
-            return "xarm_api"
-        return "trajectory"
+        """Resolve the actual joint command path."""
+        return "moveit"
 
-    def resolve_xarm_service_name(self):
-        if self.xarm_service_name != "auto":
-            return self.xarm_service_name
-
-        matches = []
-        for service_name, service_types in self.get_service_names_and_types():
-            if service_name.endswith("/set_servo_angle") and MOVE_JOINT_TYPE in service_types:
-                matches.append(service_name)
-
-        if not matches:
-            return None
-
-        if "/xarm/set_servo_angle" in matches:
-            return "/xarm/set_servo_angle"
-
-        return sorted(matches)[0]
-
-    def get_xarm_client(self):
-        if self.execution_mode != "real":
-            return None
-
-        if self.get_effective_joint_backend() in ("trajectory", "topic"):
-            return None
-
-        service_name = self.resolve_xarm_service_name()
-        if service_name is None:
-            return None
-
-        if (
-            self.xarm_client is None
-            or service_name != self.resolved_xarm_service_name
-        ):
-            self.resolved_xarm_service_name = service_name
-            self.xarm_client = self.create_client(
-                MoveJoint,
-                service_name,
-                callback_group=self.callback_group,
+    def get_xarm_utils(self):
+        if XArmUtils is None or XArmNode is None:
+            return (
+                None,
+                "xarm_utils_py is not available. Build/source xarm_utils_cpp "
+                "before using move_to_charuco.",
             )
-            self.get_logger().info(f"Forwarding commands to: {service_name}")
 
-        return self.xarm_client
+        if self.xarm is None:
+            if not self.wait_for_move_group_parameter_service():
+                return (
+                    None,
+                    "MoveIt move_group parameter service is not available: "
+                    "/move_group/get_parameters. Start/source the xArm MoveIt "
+                    "launch before calling move_to_charuco.",
+                )
+            try:
+                self.xarm_node = XArmNode("move_to_charuco_xarm_utils")
+                self.xarm = XArmUtils(self.xarm_node, self.move_group_name)
+                if self.moveit_planning_pipeline:
+                    self.xarm.set_planning_pipeline(
+                        self.moveit_planning_pipeline
+                    )
+                self.get_logger().info(
+                    "MoveGroup interface ready via xarm_utils_py: "
+                    f"group={self.move_group_name}, "
+                    f"pipeline={self.moveit_planning_pipeline or 'default'}"
+                )
+            except Exception as error:
+                self.xarm = None
+                return None, f"failed to initialize xarm_utils_py: {error}"
 
-    def resolve_cartesian_service_name(self):
-        if self.cartesian_service_name != "auto":
-            return self.cartesian_service_name
+        return self.xarm, "success"
 
-        matches = []
-        for service_name, service_types in self.get_service_names_and_types():
-            if (
-                service_name.endswith("/set_position")
-                and MOVE_CARTESIAN_TYPE in service_types
-            ):
-                matches.append(service_name)
-
-        if not matches:
-            return None
-
-        if "/xarm/set_position" in matches:
-            return "/xarm/set_position"
-
-        return sorted(matches)[0]
-
-    def get_cartesian_client(self):
-        service_name = self.resolve_cartesian_service_name()
-        if service_name is None:
-            return None
-
-        if (
-            self.cartesian_client is None
-            or service_name != self.resolved_cartesian_service_name
-        ):
-            self.resolved_cartesian_service_name = service_name
-            self.cartesian_client = self.create_client(
-                MoveCartesian,
-                service_name,
-                callback_group=self.callback_group,
-            )
-            self.get_logger().info(f"Forwarding Cartesian commands to: {service_name}")
-
-        return self.cartesian_client
+    def wait_for_move_group_parameter_service(self):
+        deadline = time.monotonic() + max(self.move_group_ready_timeout, 0.0)
+        while time.monotonic() <= deadline:
+            for service_name, _ in self.get_service_names_and_types():
+                if service_name == "/move_group/get_parameters":
+                    return True
+            time.sleep(0.1)
+        return False
 
     def handle_joint_state(self, msg):
         self.latest_joint_state = msg
@@ -615,155 +657,118 @@ class MoveToCharucoPoseNode(Node):
 
         return [positions[name] for name in self.joint_names]
 
-    def move_with_joint_trajectory_topic(
-        self, input_angles, target_positions, request, response
-    ):
-        move_duration = request.mvtime if request.mvtime > 0.0 else self.default_move_duration
-        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
-            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
-        current_positions = self.get_current_joint_positions()
+    def move_joints_with_moveit(self, target_positions, label="joint target"):
+        xarm, message = self.get_xarm_utils()
+        if xarm is None:
+            return False, -20, message
 
-        trajectory = JointTrajectory()
-        trajectory.joint_names = self.joint_names
+        target_positions = [float(value) for value in target_positions]
+        self.get_logger().info(
+            "Planning MoveGroup motion: "
+            f"{label}, target_deg="
+            f"{[round(math.degrees(value), 1) for value in target_positions]}"
+        )
 
-        if current_positions is not None:
-            start_point = JointTrajectoryPoint()
-            start_point.positions = current_positions
-            start_point.time_from_start.sec = 0
-            start_point.time_from_start.nanosec = 0
-            trajectory.points.append(start_point)
-        else:
-            self.get_logger().warn(
-                f"No usable joint state on {self.joint_state_topic}; "
-                "publishing target-only trajectory"
+        try:
+            target_ok = xarm.set_joint_value_target(target_positions)
+        except Exception as error:
+            return (
+                False,
+                -21,
+                f"MoveGroup set_joint_value_target failed: {error}",
+            )
+        if not target_ok:
+            return False, -21, "MoveGroup rejected the joint target"
+
+        try:
+            plan_success, _, plan_duration, error_code = xarm.plan()
+        except Exception as error:
+            return (
+                False,
+                -22,
+                f"MoveGroup planning threw an exception: {error}",
             )
 
-        target_point = JointTrajectoryPoint()
-        target_point.positions = target_positions
-        target_point.time_from_start.sec = int(move_duration)
-        target_point.time_from_start.nanosec = int(
-            (move_duration - int(move_duration)) * 1e9
-        )
-        trajectory.points.append(target_point)
+        error_value = getattr(error_code, "val", 0)
+        if not plan_success:
+            ret = error_value if error_value not in (0, None) else -22
+            return (
+                False,
+                ret,
+                "MoveGroup planning failed: "
+                f"error_code={error_value}, duration={plan_duration:.3f}s",
+            )
 
         self.get_logger().info(
-            "Publishing trajectory to "
-            f"{self.trajectory_topic}: angles_{self.input_unit}={input_angles}, "
-            f"duration={move_duration:.3f}s"
+            f"MoveGroup plan succeeded in {plan_duration:.3f}s; executing"
         )
 
-        if self.publish_warmup_time > 0.0:
-            time.sleep(self.publish_warmup_time)
-
-        self.trajectory_publisher.publish(trajectory)
-
-        time.sleep(move_duration + 1.0)
-        response.ret = 0
-        response.message = "success"
+        try:
+            execute_success = xarm.execute()
+        except Exception as error:
+            return False, -23, f"MoveGroup execute threw an exception: {error}"
+        if not execute_success:
+            return False, -23, "MoveGroup execute failed"
 
         if not self.wait_for_joint_state_target(target_positions):
-            response.message = (
-                "success, but /joint_states did not reach target before timeout; "
-                "RViz current state may still be stale"
+            return (
+                False,
+                -24,
+                "/joint_states did not reach the MoveGroup target before "
+                "joint_state_sync_timeout",
             )
-            self.get_logger().warn(response.message)
-            return response
 
-        self.get_logger().info("Trajectory published and /joint_states reached target")
-        return response
+        return True, 0, "success"
 
-    def move_with_joint_trajectory(self, input_angles, target_positions, request, response):
-        if self.get_effective_joint_backend() == "xarm_api":
-            response.ret = -2
-            response.message = "xArm set_servo_angle service not found"
-            self.get_logger().error(response.message)
-            return response
+    def get_pre_marker_positions_rad(self):
+        return [
+            math.radians(float(value))
+            for value in self.pre_marker_joint_degrees
+        ]
 
-        if not self.trajectory_action_client.wait_for_server(timeout_sec=10.0):
-            response.ret = -5
-            response.message = (
-                f"Action server not available: {self.trajectory_action_name}. "
-                "Start xarm6_moveit_fake.launch.py or xarm6_moveit_realmove.launch.py."
-            )
-            self.get_logger().error(response.message)
-            return response
-
-        move_duration = request.mvtime if request.mvtime > 0.0 else self.default_move_duration
-        trajectory = JointTrajectory()
-        # stampはゼロのままにする。ゼロ以外を入れると、コントローラへ届く頃には
-        # その時刻が過去になっており、軌道が拒否される。
-        trajectory.joint_names = self.joint_names
-
-        point = JointTrajectoryPoint()
-        point.positions = target_positions
-        point.time_from_start = Duration(seconds=move_duration).to_msg()
-        trajectory.points.append(point)
-
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory
+    def move_to_pre_marker_pose(self):
+        if not self.prepare_before_marker_move:
+            return True, 0, "pre-marker move disabled"
 
         self.get_logger().info(
-            "Sending trajectory goal: "
-            f"angles_{self.input_unit}={input_angles}, duration={move_duration:.3f}s"
+            "Moving to pre-marker pose before executing the requested target"
+        )
+        return self.move_joints_with_moveit(
+            self.get_pre_marker_positions_rad(),
+            "pre-marker pose",
         )
 
-        send_goal_future = self.trajectory_action_client.send_goal_async(goal)
-        if not self.wait_for_future(send_goal_future, 10.0):
-            response.ret = -6
-            response.message = "Timed out sending trajectory goal"
-            self.get_logger().error(response.message)
-            return response
+    def return_to_pre_marker_pose_after_success(self):
+        if not self.return_to_pre_marker_after_success:
+            return True, 0, "return-to-pre-marker disabled"
 
-        if send_goal_future.exception() is not None:
-            response.ret = -7
-            response.message = (
-                f"Failed to send trajectory goal: {send_goal_future.exception()}"
-            )
-            self.get_logger().error(response.message)
-            return response
+        self.get_logger().info(
+            "Returning to pre-marker pose after the requested target succeeded"
+        )
+        return self.move_joints_with_moveit(
+            self.get_pre_marker_positions_rad(),
+            "return to pre-marker pose",
+        )
 
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
-            response.ret = -8
-            response.message = "Trajectory goal rejected"
-            self.get_logger().error(response.message)
-            return response
+    def wait_for_detection_after_pre_marker(self):
+        if self.pre_marker_detection_window_sec <= 0.0:
+            return
 
-        result_future = goal_handle.get_result_async()
-        wait_timeout = move_duration + 10.0
-        if not self.wait_for_future(result_future, wait_timeout):
-            response.ret = -9
-            response.message = "Timed out waiting for trajectory completion"
-            self.get_logger().error(response.message)
-            return response
+        success, message = self.set_find_cube_detection_enabled(
+            True,
+            required=True,
+        )
+        if not success:
+            raise RuntimeError(message)
 
-        if result_future.exception() is not None:
-            response.ret = -10
-            response.message = f"Trajectory action failed: {result_future.exception()}"
-            self.get_logger().error(response.message)
-            return response
-
-        result = result_future.result().result
-        response.ret = result.error_code
-        response.message = result.error_string if result.error_string else "success"
-
-        if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
-            self.get_logger().error(
-                "Trajectory failed: "
-                f"error_code={result.error_code}, message={response.message}"
-            )
-            return response
-
-        if not self.wait_for_joint_state_target(target_positions):
-            response.message = (
-                "success, but /joint_states did not reach target before timeout; "
-                "RViz current state may still be stale"
-            )
-            self.get_logger().warn(response.message)
-            return response
-
-        self.get_logger().info("Trajectory completed and /joint_states reached target")
-        return response
+        self.get_logger().info(
+            "Waiting for cube detection after pre-marker move: "
+            f"{self.pre_marker_detection_window_sec:.1f}s"
+        )
+        try:
+            time.sleep(self.pre_marker_detection_window_sec)
+        finally:
+            self.set_find_cube_detection_enabled(False, required=False)
 
     @staticmethod
     def wait_for_future(future, timeout):
@@ -793,6 +798,21 @@ class MoveToCharucoPoseNode(Node):
         return self._handle_cube_move_request("right", response)
 
     def _handle_cube_move_request(self, side, response):
+        self.set_find_cube_detection_enabled(False, required=False)
+
+        success, ret, message = self.move_to_pre_marker_pose()
+        if not success:
+            return self.set_trigger_response(
+                response,
+                False,
+                f"pre-marker move failed: ret={ret}, {message}",
+            )
+
+        try:
+            self.wait_for_detection_after_pre_marker()
+        except RuntimeError as e:
+            return self.set_trigger_response(response, False, str(e))
+
         try:
             cube_pose, pose_source = self.get_cube_pose_for_move(side)
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
@@ -821,12 +841,37 @@ class MoveToCharucoPoseNode(Node):
         if not success:
             return self.set_trigger_response(response, False, message)
 
+        detect_success, detect_message = self.call_multi_cube_detect_once()
+
+        success, ret, message = self.return_to_pre_marker_pose_after_success()
+        if not success:
+            return self.set_trigger_response(
+                response,
+                False,
+                f"return to pre-marker pose failed: ret={ret}, {message}",
+            )
+
+        if not detect_success:
+            return self.set_trigger_response(
+                response,
+                False,
+                (
+                    f"multi-cube detection failed after approach: "
+                    f"{detect_message}; returned to pre-marker pose"
+                ),
+            )
+
+        if self.restore_find_cube_detection_after_move:
+            self.set_find_cube_detection_enabled(True, required=False)
+
         return self.set_trigger_response(
             response,
             True,
             (
                 f"moved to {side} cube approach pose from {pose_source}: "
-                f"pose_mm_rad={cartesian_pose}"
+                f"pose_mm_rad={cartesian_pose}; "
+                f"multi_cube_detection={detect_message}; "
+                f"returned to pre-marker pose"
             ),
         )
 
@@ -1274,7 +1319,7 @@ class MoveToCharucoPoseNode(Node):
                     "y": float(approach_position_m["y"]),
                     "z": float(approach_position_m["z"]),
                 },
-                "xarm_set_position_pose_mm_rad": [
+                "moveit_target_pose_mm_rad": [
                     float(value) for value in cartesian_pose
                 ],
             },
@@ -1297,236 +1342,49 @@ class MoveToCharucoPoseNode(Node):
         return data
 
     def move_with_cartesian_pose(self, cartesian_pose, side="latest"):
-        if self.execution_mode == "sim":
-            return self.move_with_sim_cartesian_pose(
-                cartesian_pose,
-                side,
-            )
+        return self.move_with_moveit_cartesian_pose(cartesian_pose, side)
 
-        if self.real_use_moveit_ik:
-            success, message = self.move_with_real_ik_pose(cartesian_pose, side)
-            if success:
-                return True, message
-
-            self.get_logger().warn(
-                f"Falling back to the xArm set_position path: {message}. "
-                "The xArm firmware will solve the IK and plan the motion "
-                "itself, so the result will NOT match execution_mode:=sim."
-            )
-
-        return self.move_with_real_cartesian_pose(cartesian_pose)
-
-    def move_with_real_ik_pose(self, cartesian_pose, side="latest"):
-        """Solve with MoveIt IK, then send the joints to the real xArm.
-
-        simと同じIK・同じ関節指令を使うため、simで確認した動きが実機でも
-        そのまま再現される。set_positionはxArm側でIKと経路生成を行うため
-        simと一致しない。
-        """
+    def move_with_moveit_cartesian_pose(self, cartesian_pose, side="latest"):
+        """Solve a Cartesian target, then execute via MoveGroup."""
         if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
             self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
+
+        target_joint1 = None
+        if self.align_joint1_before_move:
+            current_positions = self.get_current_joint_positions()
+            target_joint1 = self.compute_target_joint1_rad(
+                cartesian_pose,
+                current_positions[0] if current_positions else None,
+            )
+            if target_joint1 is None:
+                self.get_logger().warn(
+                    "The target is on the link_base Z axis, so the joint1 "
+                    "azimuth is undefined; skipping the alignment move."
+                )
+            else:
+                success, message = self.align_joint1_with_trajectory(
+                    target_joint1,
+                    side,
+                )
+                if not success:
+                    return False, f"joint1 alignment failed: {message}"
 
         success, target_positions, message = self.request_ik_solution(
             cartesian_pose,
             side,
+            target_joint1,
         )
         if not success:
             return False, message
 
-        return self.move_joints_with_xarm(target_positions)
-
-    def move_joints_with_xarm(self, target_positions):
-        """Send joint angles to the real xArm with set_servo_angle."""
-        service_name = self.resolve_xarm_service_name()
-        if service_name is None:
-            return False, "xArm set_servo_angle service not found"
-
-        client = self.create_client(
-            MoveJoint,
-            service_name,
-            callback_group=self.callback_group,
+        success, ret, message = self.move_joints_with_moveit(
+            target_positions,
+            "Cartesian IK solution",
         )
-        if not client.wait_for_service(timeout_sec=10.0):
-            return False, f"xArm service not available: {service_name}"
-
-        success, message = self.prepare_xarm_for_cartesian()
         if not success:
             return False, message
 
-        request = MoveJoint.Request()
-        request.angles = [float(value) for value in target_positions]
-        request.speed = self.default_speed
-        request.acc = self.default_acc
-        request.mvtime = 0.0
-        request.wait = True
-        request.timeout = self.default_timeout
-        request.radius = self.default_radius
-        request.relative = False
-
-        self.get_logger().info(
-            f"Moving joints via {service_name}: angles_deg="
-            f"{[round(math.degrees(v), 1) for v in target_positions]}, "
-            f"speed={request.speed} rad/s, acc={request.acc} rad/s^2"
-        )
-
-        future = client.call_async(request)
-        if not self.wait_for_future(future, request.timeout + 5.0):
-            return False, "Timed out waiting for xArm set_servo_angle response"
-
-        if future.exception() is not None:
-            return False, f"set_servo_angle failed: {future.exception()}"
-
-        result = future.result()
-        if result.ret != 0:
-            return (
-                False,
-                f"set_servo_angle failed: ret={result.ret}, "
-                f"message={result.message}",
-            )
-
-        self.wait_for_joint_state_target(target_positions)
-        return True, "real Cartesian move succeeded via MoveIt IK -> " + service_name
-
-    def move_with_real_cartesian_pose(self, cartesian_pose):
-        cartesian_client = self.get_cartesian_client()
-        if cartesian_client is None:
-            return False, "xArm Cartesian service not found"
-
-        if not cartesian_client.wait_for_service(timeout_sec=10.0):
-            return (
-                False,
-                f"xArm Cartesian service not available: "
-                f"{self.resolved_cartesian_service_name}",
-            )
-
-        if self.prepare_xarm_before_cartesian:
-            success, message = self.prepare_xarm_for_cartesian()
-            if not success:
-                return False, message
-
-        if self.align_joint1_before_move:
-            success, message = self.align_joint1_with_xarm(cartesian_pose)
-            if not success:
-                return False, f"joint1 alignment failed: {message}"
-
-        request = MoveCartesian.Request()
-        request.pose = [float(value) for value in cartesian_pose]
-        request.speed = self.cartesian_speed
-        request.acc = self.cartesian_acc
-        request.mvtime = 0.0
-        request.wait = self.cartesian_wait
-        request.timeout = self.cartesian_timeout
-        request.radius = self.cartesian_radius
-        request.is_tool_coord = False
-        request.relative = False
-        request.motion_type = self.cartesian_motion_type
-
-        self.get_logger().info(
-            f"Moving Cartesian pose: pose_mm_rad={request.pose}, "
-            f"speed={request.speed} mm/s, acc={request.acc} mm/s^2, "
-            f"wait={request.wait}"
-        )
-
-        future = cartesian_client.call_async(request)
-        wait_timeout = request.timeout + 5.0 if request.wait else 30.0
-        if not self.wait_for_future(future, wait_timeout):
-            return False, "Timed out waiting for xArm Cartesian service response"
-
-        if future.exception() is not None:
-            return False, f"xArm Cartesian service call failed: {future.exception()}"
-
-        result = future.result()
-        self.get_logger().info(
-            f"set_position response: ret={result.ret}, message={result.message}"
-        )
-        if result.ret != 0:
-            return (
-                False,
-                f"set_position failed: ret={result.ret}, message={result.message}",
-            )
-
-        return True, result.message if result.message else "success"
-
-    def align_joint1_with_xarm(self, cartesian_pose):
-        """Rotate joint1 to the target azimuth with set_servo_angle."""
-        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
-            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
-
-        current_positions = self.get_current_joint_positions()
-        if current_positions is None:
-            return (
-                False,
-                f"No joint state on {self.joint_state_topic}; cannot rotate "
-                "joint1 before the Cartesian move.",
-            )
-
-        target_joint1 = self.compute_target_joint1_rad(
-            cartesian_pose,
-            current_positions[0],
-        )
-        if target_joint1 is None:
-            self.get_logger().warn(
-                "The target is on the link_base Z axis, so the joint1 azimuth "
-                "is undefined; skipping the alignment move."
-            )
-            return True, "joint1 azimuth undefined"
-
-        if abs(target_joint1 - current_positions[0]) <= self.joint1_align_tolerance_rad:
-            self.get_logger().info(
-                "joint1 is already on the target azimuth "
-                f"({math.degrees(current_positions[0]):.1f} deg); "
-                "skipping the alignment move."
-            )
-            return True, "joint1 already aligned"
-
-        service_name = self.resolve_xarm_service_name()
-        if service_name is None:
-            return False, "xArm set_servo_angle service not found"
-
-        client = self.create_client(
-            MoveJoint,
-            service_name,
-            callback_group=self.callback_group,
-        )
-        if not client.wait_for_service(timeout_sec=10.0):
-            return False, f"xArm service not available: {service_name}"
-
-        aligned_positions = list(current_positions)
-        aligned_positions[0] = float(target_joint1)
-
-        request = MoveJoint.Request()
-        request.angles = aligned_positions
-        request.speed = self.default_speed
-        request.acc = self.default_acc
-        request.mvtime = 0.0
-        request.wait = True
-        request.timeout = self.default_timeout
-        request.radius = self.default_radius
-        request.relative = False
-
-        self.get_logger().info(
-            "Aligning joint1 before the Cartesian move: "
-            f"{math.degrees(current_positions[0]):.1f} deg -> "
-            f"{math.degrees(target_joint1):.1f} deg via {service_name}"
-        )
-
-        future = client.call_async(request)
-        if not self.wait_for_future(future, request.timeout + 5.0):
-            return False, "Timed out waiting for the joint1 alignment response"
-
-        if future.exception() is not None:
-            return False, f"set_servo_angle failed: {future.exception()}"
-
-        result = future.result()
-        if result.ret != 0:
-            return (
-                False,
-                f"set_servo_angle failed: ret={result.ret}, "
-                f"message={result.message}",
-            )
-
-        self.wait_for_joint_state_target(aligned_positions)
-        return True, result.message if result.message else "success"
+        return True, "Cartesian move succeeded via MoveIt IK -> MoveGroup"
 
     def get_sim_ik_client(self):
         if GetPositionIK is None:
@@ -1539,6 +1397,120 @@ class MoveToCharucoPoseNode(Node):
                 callback_group=self.callback_group,
             )
         return self.sim_ik_client
+
+    def get_find_cube_detection_client(self):
+        if self.find_cube_detection_client is None:
+            self.find_cube_detection_client = self.create_client(
+                SetBool,
+                self.find_cube_detection_service_name,
+                callback_group=self.callback_group,
+            )
+        return self.find_cube_detection_client
+
+    def set_find_cube_detection_enabled(self, enabled, required=False):
+        if not self.manage_find_cube_detection:
+            return True, "find_cube detection management disabled"
+
+        client = self.get_find_cube_detection_client()
+        timeout = max(self.find_cube_detection_service_timeout, 0.0)
+        if not client.wait_for_service(timeout_sec=timeout):
+            message = (
+                f"find_cube detection service is not available: "
+                f"{self.find_cube_detection_service_name}"
+            )
+            if required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = client.call_async(request)
+        if not self.wait_for_future(future, timeout + 1.0):
+            message = "timed out waiting for find_cube detection service"
+            if required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        if future.exception() is not None:
+            message = (
+                f"find_cube detection service call failed: "
+                f"{future.exception()}"
+            )
+            if required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        result = future.result()
+        if not result.success:
+            message = result.message or "find_cube detection service returned false"
+            if required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        self.get_logger().info(result.message)
+        return True, result.message
+
+    def get_multi_cube_detect_client(self):
+        if self.multi_cube_detect_client is None:
+            self.multi_cube_detect_client = self.create_client(
+                Trigger,
+                self.multi_cube_detect_service_name,
+                callback_group=self.callback_group,
+            )
+        return self.multi_cube_detect_client
+
+    def call_multi_cube_detect_once(self):
+        if not self.detect_multi_cube_after_approach:
+            return True, "multi-cube detection after approach disabled"
+
+        client = self.get_multi_cube_detect_client()
+        timeout = max(self.multi_cube_detect_service_timeout, 0.0)
+        if not client.wait_for_service(timeout_sec=timeout):
+            message = (
+                f"multi-cube detect service is not available: "
+                f"{self.multi_cube_detect_service_name}"
+            )
+            if self.multi_cube_detect_required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        self.get_logger().info(
+            f"Calling multi-cube ChArUco detection: "
+            f"{self.multi_cube_detect_service_name}"
+        )
+        future = client.call_async(Trigger.Request())
+        if not self.wait_for_future(future, timeout):
+            message = "timed out waiting for multi-cube detect service"
+            if self.multi_cube_detect_required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        if future.exception() is not None:
+            message = (
+                f"multi-cube detect service call failed: "
+                f"{future.exception()}"
+            )
+            if self.multi_cube_detect_required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        result = future.result()
+        if not result.success:
+            message = result.message or "multi-cube detect service returned false"
+            if self.multi_cube_detect_required:
+                return False, message
+            self.get_logger().warn(message)
+            return True, message
+
+        self.get_logger().info(result.message)
+        return True, result.message
 
     def get_side_for_ik_seed(self, side):
         if side == "latest":
@@ -1602,30 +1574,12 @@ class MoveToCharucoPoseNode(Node):
         return yaw if best is None else best
 
     def execute_joint_positions(self, target_positions, duration):
-        request = MoveJoint.Request()
-        request.angles = [float(value) for value in target_positions]
-        request.mvtime = float(duration)
-        request.wait = True
-        response = MoveJoint.Response()
-
-        if self.get_effective_joint_backend() == "topic":
-            result = self.move_with_joint_trajectory_topic(
-                target_positions,
-                target_positions,
-                request,
-                response,
-            )
-        else:
-            result = self.move_with_joint_trajectory(
-                target_positions,
-                target_positions,
-                request,
-                response,
-            )
-
-        if result.ret != FollowJointTrajectory.Result.SUCCESSFUL:
-            return False, result.message
-        return True, result.message
+        del duration
+        success, _, message = self.move_joints_with_moveit(
+            target_positions,
+            "joint1 alignment",
+        )
+        return success, message
 
     def align_joint1_with_trajectory(self, target_joint1, side):
         """Rotate joint1 only, keeping the other joints where they are."""
@@ -1787,127 +1741,12 @@ class MoveToCharucoPoseNode(Node):
 
         return True, target_positions, "success"
 
-    def move_with_sim_cartesian_pose(self, cartesian_pose, side="latest"):
-        """Convert a Cartesian target to joints with MoveIt IK, then use ros2_control."""
-        if self.latest_joint_state is None and self.publish_warmup_time > 0.0:
-            self.latest_joint_state_event.wait(timeout=self.publish_warmup_time)
-
-        target_joint1 = None
-        if self.align_joint1_before_move:
-            current_positions = self.get_current_joint_positions()
-            target_joint1 = self.compute_target_joint1_rad(
-                cartesian_pose,
-                current_positions[0] if current_positions else None,
-            )
-            if target_joint1 is None:
-                self.get_logger().warn(
-                    "The target is on the link_base Z axis, so the joint1 "
-                    "azimuth is undefined; skipping the alignment move."
-                )
-            else:
-                success, message = self.align_joint1_with_trajectory(
-                    target_joint1,
-                    side,
-                )
-                if not success:
-                    return False, f"joint1 alignment failed: {message}"
-
-        success, target_positions, message = self.request_ik_solution(
-            cartesian_pose,
-            side,
-            target_joint1,
-        )
-        if not success:
-            return False, message
-
-        success, message = self.execute_joint_positions(
-            target_positions,
-            self.sim_cartesian_move_duration,
-        )
-        if not success:
-            return False, message
-
-        return (
-            True,
-            "simulation Cartesian move succeeded via "
-            f"{self.sim_ik_service_name} -> "
-            f"{self.trajectory_action_name}",
-        )
-
-    def prepare_xarm_for_cartesian(self):
-        namespace = self.get_xarm_namespace()
-        steps = [
-            (
-                f"{namespace}/motion_enable",
-                SetInt16ById,
-                {"id": 8, "data": 1},
-            ),
-            (
-                f"{namespace}/set_mode",
-                SetInt16,
-                {"data": self.cartesian_mode},
-            ),
-            (
-                f"{namespace}/set_state",
-                SetInt16,
-                {"data": self.cartesian_state},
-            ),
-        ]
-
-        for service_name, service_type, values in steps:
-            success, message = self.call_prepare_service(
-                service_name,
-                service_type,
-                values,
-            )
-            if not success:
-                return False, message
-
-        return True, "xArm is ready for Cartesian command"
-
-    def get_xarm_namespace(self):
-        service_name = self.resolved_cartesian_service_name or "/xarm/set_position"
-        if service_name.endswith("/set_position"):
-            namespace = service_name[: -len("/set_position")]
-            return namespace if namespace else "/xarm"
-        return "/xarm"
-
-    def call_prepare_service(self, service_name, service_type, values):
-        client = self.create_client(
-            service_type,
-            service_name,
-            callback_group=self.callback_group,
-        )
-        if not client.wait_for_service(timeout_sec=5.0):
-            return False, f"xArm prepare service not available: {service_name}"
-
-        request = service_type.Request()
-        for key, value in values.items():
-            setattr(request, key, value)
-
-        future = client.call_async(request)
-        if not self.wait_for_future(future, 10.0):
-            return False, f"Timed out waiting for {service_name}"
-
-        if future.exception() is not None:
-            return False, f"{service_name} failed: {future.exception()}"
-
-        result = future.result()
-        self.get_logger().info(
-            f"{service_name} response: ret={result.ret}, "
-            f"message={result.message}"
-        )
-        if result.ret != 0:
-            return (
-                False,
-                f"{service_name} failed: ret={result.ret}, "
-                f"message={result.message}",
-            )
-
-        return True, result.message if result.message else "success"
-
     def _handle_move_request(self, request, response, default_angles):
-        input_angles = list(request.angles) if request.angles else default_angles
+        self.set_find_cube_detection_enabled(False, required=False)
+
+        input_angles = (
+            list(request.angles) if request.angles else default_angles
+        )
         if len(input_angles) != 6:
             response.ret = -1
             response.message = (
@@ -1916,99 +1755,61 @@ class MoveToCharucoPoseNode(Node):
             self.get_logger().error(response.message)
             return response
 
+        success, ret, message = self.move_to_pre_marker_pose()
+        if not success:
+            response.ret = ret
+            response.message = f"pre-marker move failed: {message}"
+            self.get_logger().error(response.message)
+            return response
+
         if self.input_unit == "deg":
             xarm_angles = [math.radians(angle) for angle in input_angles]
         else:
-            xarm_angles = input_angles
+            xarm_angles = [float(angle) for angle in input_angles]
 
-        effective_backend = self.get_effective_joint_backend()
-        if effective_backend == "topic":
-            return self.move_with_joint_trajectory_topic(
-                input_angles,
-                xarm_angles,
-                request,
-                response,
+        if request.relative:
+            current_positions = self.get_current_joint_positions()
+            if current_positions is None:
+                response.ret = -25
+                response.message = (
+                    f"No joint state on {self.joint_state_topic}; cannot "
+                    "convert relative joint command to an absolute MoveGroup "
+                    "target"
+                )
+                self.get_logger().error(response.message)
+                return response
+            xarm_angles = [
+                current + delta
+                for current, delta in zip(current_positions, xarm_angles)
+            ]
+
+        if request.speed > 0.0 or request.acc > 0.0 or request.mvtime > 0.0:
+            self.get_logger().warn(
+                "speed/acc/mvtime parameters are accepted for service "
+                "compatibility, but MoveGroup planning/execution uses the "
+                "MoveIt configuration for timing."
             )
 
-        if effective_backend == "trajectory":
-            return self.move_with_joint_trajectory(
-                input_angles,
-                xarm_angles,
-                request,
-                response,
-            )
-
-        xarm_client = self.get_xarm_client()
-        if xarm_client is None:
-            response.ret = -2
-            response.message = (
-                "xArm set_servo_angle service not found in real mode"
-            )
-            self.get_logger().error(response.message)
-            return response
-
-        if not xarm_client.wait_for_service(timeout_sec=10.0):
-            response.ret = -2
-            response.message = (
-                f"xArm service not available: {self.resolved_xarm_service_name}"
-            )
-            self.get_logger().error(response.message)
-            return response
-
-        xarm_request = MoveJoint.Request()
-        xarm_request.angles = xarm_angles
-        xarm_request.speed = request.speed if request.speed > 0.0 else self.default_speed
-        xarm_request.acc = request.acc if request.acc > 0.0 else self.default_acc
-        xarm_request.mvtime = request.mvtime
-        xarm_request.wait = request.wait or self.default_wait
-        xarm_request.timeout = (
-            request.timeout if request.timeout >= 0.0 else self.default_timeout
+        success, ret, message = self.move_joints_with_moveit(
+            xarm_angles,
+            f"angles_{self.input_unit}={input_angles}",
         )
-        xarm_request.radius = (
-            request.radius if request.radius >= 0.0 else self.default_radius
-        )
-        xarm_request.relative = request.relative
+        if success:
+            success, ret, message = self.return_to_pre_marker_pose_after_success()
+            if not success:
+                message = f"return to pre-marker pose failed: {message}"
+            elif self.restore_find_cube_detection_after_move:
+                self.set_find_cube_detection_enabled(True, required=False)
 
-        self.get_logger().info(
-            f"Moving joints: angles_{self.input_unit}={input_angles}, "
-            f"speed={xarm_request.speed} rad/s, acc={xarm_request.acc} rad/s^2"
-        )
-
-        future = xarm_client.call_async(xarm_request)
-        wait_timeout = xarm_request.timeout + 5.0 if xarm_request.wait else 30.0
-
-        if not self.wait_for_future(future, wait_timeout):
-            response.ret = -4
-            response.message = "Timed out waiting for xArm service response"
-            self.get_logger().error(response.message)
-            return response
-
-        if future.exception() is not None:
-            response.ret = -3
-            response.message = f"xArm service call failed: {future.exception()}"
-            self.get_logger().error(response.message)
-            return response
-
-        xarm_response = future.result()
-        response.ret = xarm_response.ret
-        response.message = xarm_response.message if xarm_response.message else "success"
-
-        if xarm_response.ret != 0:
-            self.get_logger().error(
-                "set_servo_angle failed: "
-                f"ret={xarm_response.ret}, message={xarm_response.message}"
+        response.ret = ret
+        response.message = message
+        if success:
+            self.get_logger().info(
+                "Target pose command succeeded via MoveGroup and returned "
+                "to pre-marker pose"
             )
-            return response
-
-        if not self.wait_for_joint_state_target(xarm_angles):
-            response.message = (
-                "success, but /joint_states did not reach target before timeout; "
-                "RViz current state may still be stale"
-            )
-            self.get_logger().warn(response.message)
-            return response
-
-        self.get_logger().info("Target pose command succeeded")
+        else:
+            self.get_logger().error(message)
         return response
 
 

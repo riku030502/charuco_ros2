@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -66,6 +67,7 @@ class CharucoTargetDetectorNode(Node):
             self.get_parameter("max_detection_rate").value
         )
         self.axis_length = float(self.get_parameter("axis_length").value)
+        self.resolved_board_config_path = ""
 
         self.board_config = self.load_config()
         self.aruco_dict = get_aruco_dictionary(self.board_config["dictionary"])
@@ -117,6 +119,10 @@ class CharucoTargetDetectorNode(Node):
         self.get_logger().info(
             f"board_config_path: {self.board_config_path or '<defaults>'}"
         )
+        if self.resolved_board_config_path:
+            self.get_logger().info(
+                f"resolved board config: {self.resolved_board_config_path}"
+            )
         self.get_logger().info(f"output_frame_id: {self.output_frame_id}")
         self.get_logger().info(
             f"board: {self.board_config['squares_x']}x"
@@ -126,7 +132,8 @@ class CharucoTargetDetectorNode(Node):
 
     def load_config(self):
         if self.board_config_path:
-            path = os.path.expanduser(self.board_config_path)
+            path = self.resolve_board_config_path(self.board_config_path)
+            self.resolved_board_config_path = str(path)
             return load_board_config(path)
 
         config = dict(CUBE_CHARUCO_DEFAULTS)
@@ -137,6 +144,25 @@ class CharucoTargetDetectorNode(Node):
             }
         )
         return validate_board_config(config)
+
+    def resolve_board_config_path(self, config_path: str) -> Path:
+        path = Path(os.path.expanduser(config_path))
+        if path.is_absolute():
+            return path
+
+        cwd_path = Path.cwd() / path
+        if cwd_path.exists():
+            return cwd_path
+
+        package_dir = Path(__file__).resolve().parent
+        if path.parts and path.parts[0] == "charuco_ros2":
+            return package_dir / Path(*path.parts[1:])
+
+        package_path = package_dir / path
+        if package_path.exists():
+            return package_path
+
+        return cwd_path
 
     def camera_info_callback(self, msg: CameraInfo):
         self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)

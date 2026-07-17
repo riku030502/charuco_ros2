@@ -3,14 +3,19 @@ import cv2
 import json
 import numpy as np
 import os
+import threading
+import time
 
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
+from std_srvs.srv import Trigger
 
 from cv_bridge import CvBridge
 from tf2_ros import (
@@ -41,6 +46,12 @@ class MultiCharucoDetectorNode(Node):
         self.declare_parameter("image_topic", "/camera/hand_camera/color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/hand_camera/color/camera_info")
         self.declare_parameter("debug_image_topic", "/charuco/debug_image")
+        self.declare_parameter(
+            "detect_service_name",
+            "/multi_cube_charuco_detector/detect_once",
+        )
+        self.declare_parameter("detection_window_sec", 2.0)
+        self.declare_parameter("detect_continuously", False)
 
         self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
 
@@ -96,6 +107,13 @@ class MultiCharucoDetectorNode(Node):
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
+        self.detect_service_name = self.get_parameter("detect_service_name").value
+        self.detection_window_sec = float(
+            self.get_parameter("detection_window_sec").value
+        )
+        self.detect_continuously = bool(
+            self.get_parameter("detect_continuously").value
+        )
 
         self.parent_frame = self.get_parameter("parent_frame").value
 
@@ -326,10 +344,16 @@ class MultiCharucoDetectorNode(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.camera_info_received = False
+        self.camera_info_event = threading.Event()
+        self.detection_lock = threading.Lock()
+        self.detection_active_until = 0.0
+        self.detection_success_event = threading.Event()
+        self.latest_detection_message = ""
 
         # =========================
         # ROS
         # =========================
+        self.callback_group = ReentrantCallbackGroup()
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -345,6 +369,7 @@ class MultiCharucoDetectorNode(Node):
             self.camera_info_topic,
             self.camera_info_callback,
             10,
+            callback_group=self.callback_group,
         )
 
         self.image_sub = self.create_subscription(
@@ -352,6 +377,7 @@ class MultiCharucoDetectorNode(Node):
             self.image_topic,
             self.image_callback,
             10,
+            callback_group=self.callback_group,
         )
 
         self.debug_pub = self.create_publisher(
@@ -359,11 +385,22 @@ class MultiCharucoDetectorNode(Node):
             self.debug_image_topic,
             10,
         )
+        self.detect_service = self.create_service(
+            Trigger,
+            self.detect_service_name,
+            self.handle_detect_once,
+            callback_group=self.callback_group,
+        )
 
         self.get_logger().info("Multi ChArUco detector node started")
         self.get_logger().info(f"image_topic: {self.image_topic}")
         self.get_logger().info(f"camera_info_topic: {self.camera_info_topic}")
         self.get_logger().info(f"debug_image_topic: {self.debug_image_topic}")
+        self.get_logger().info(
+            f"detect_service_name: {self.detect_service_name}, "
+            f"detection_window_sec={self.detection_window_sec:.1f}, "
+            f"detect_continuously={self.detect_continuously}"
+        )
         self.get_logger().info(f"parent_frame: {self.parent_frame}")
         self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
         self.get_logger().info(f"square_length: {self.square_length} m")
@@ -449,12 +486,81 @@ class MultiCharucoDetectorNode(Node):
             charuco_detector.setCharucoParameters(charuco_params)
 
         self.camera_info_received = True
+        self.camera_info_event.set()
 
         self.get_logger().info("CameraInfo received")
         self.get_logger().info(f"camera_matrix:\n{self.camera_matrix}")
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
 
+    def handle_detect_once(self, request, response):
+        del request
+
+        if self.detection_window_sec <= 0.0:
+            response.success = False
+            response.message = "detection_window_sec must be positive"
+            return response
+
+        if not self.camera_info_received:
+            self.get_logger().info(
+                "Waiting for CameraInfo before starting cube detection"
+            )
+            self.camera_info_event.wait(timeout=min(self.detection_window_sec, 2.0))
+
+        if not self.camera_info_received:
+            response.success = False
+            response.message = "timed out waiting for CameraInfo"
+            self.get_logger().warn(response.message)
+            return response
+
+        with self.detection_lock:
+            self.latest_detection_message = ""
+            self.detection_success_event.clear()
+            self.detection_active_until = (
+                time.monotonic() + self.detection_window_sec
+            )
+
+        self.get_logger().info(
+            f"Cube ChArUco detection enabled for "
+            f"{self.detection_window_sec:.1f}s"
+        )
+
+        detected = self.detection_success_event.wait(
+            timeout=self.detection_window_sec
+        )
+
+        with self.detection_lock:
+            message = self.latest_detection_message
+            self.detection_active_until = 0.0
+
+        if detected:
+            response.success = True
+            response.message = message or "cube ChArUco detection succeeded"
+            self.get_logger().info(response.message)
+        else:
+            response.success = False
+            response.message = (
+                message
+                or f"no cube ChArUco pose detected in "
+                f"{self.detection_window_sec:.1f}s"
+            )
+            self.get_logger().warn(response.message)
+        return response
+
+    def detection_is_active(self):
+        if self.detect_continuously:
+            return True
+        with self.detection_lock:
+            return time.monotonic() <= self.detection_active_until
+
+    def notify_detection_success(self, message):
+        with self.detection_lock:
+            self.latest_detection_message = message
+        self.detection_success_event.set()
+
     def image_callback(self, msg: Image):
+        if not self.detection_is_active():
+            return
+
         if not self.camera_info_received:
             self.get_logger().warn(
                 "Waiting for CameraInfo...",
@@ -523,7 +629,7 @@ class MultiCharucoDetectorNode(Node):
             if result.get("pose_success", False)
         ]
 
-        self.publish_cube_transforms(msg, ok_boards)
+        camera_link_transforms = self.publish_cube_transforms(msg, ok_boards)
 
         if ok_boards:
             board_text = ", ".join(
@@ -537,7 +643,27 @@ class MultiCharucoDetectorNode(Node):
                 f"Detected ChArUco boards: {board_text}",
                 throttle_duration_sec=1.0,
             )
+            if camera_link_transforms:
+                child_frames = ", ".join(
+                    transform.child_frame_id
+                    for transform in camera_link_transforms
+                )
+                self.notify_detection_success(
+                    f"cube ChArUco detection succeeded; updated TF(s): "
+                    f"{child_frames}; boards={board_text}"
+                )
+            else:
+                with self.detection_lock:
+                    self.latest_detection_message = (
+                        f"detected board pose(s), but no camera_link TF was "
+                        f"updated; boards={board_text}"
+                    )
         else:
+            with self.detection_lock:
+                self.latest_detection_message = (
+                    f"no valid ChArUco board pose; "
+                    f"markers={total_detected_markers}"
+                )
             self.get_logger().info(
                 f"No valid ChArUco board pose. markers={total_detected_markers}",
                 throttle_duration_sec=2.0,
@@ -914,11 +1040,11 @@ class MultiCharucoDetectorNode(Node):
           - 面間オフセットでは +X=右, +Y=下, +Z=奥 として扱う
 
         面ごとの回転はキューブ形状から決める。並進は実測した面間関係を使う。
-        実測したfront原点（各面ボード座標）:
-          top:   手前4.5 cm, 下0.5 cm
-          right: 手前0.3 cm, 左4.3 cm
-          left:  手前4.5 cm, 右0.5 cm
-          back:  手前5.0 cm, 左3.5 cm
+        実測したfront原点（各面を正面から見た各面ボード座標）:
+          top:   下4.5 cm, 奥0.5 cm
+          left:  右4.5 cm, 奥0.5 cm
+          right: 奥4.5 cm, 左0.5 cm
+          back:  奥5.0 cm, 右4.0 cm
 
         参考: キューブ形状だけで置いた場合の面ごとの原点（キューブ座標）:
           front: (0,  0,  0)
@@ -977,10 +1103,10 @@ class MultiCharucoDetectorNode(Node):
         """
         measured_offsets = {
             "front": np.array([0.0, 0.0, 0.0], dtype=float),
-            "top": np.array([0.0, 0.005, -0.045], dtype=float),
-            "right": np.array([-0.043, 0.0, -0.003], dtype=float),
-            "left": np.array([0.005, 0.0, -0.045], dtype=float),
-            "back": np.array([-0.035, 0.0, -0.050], dtype=float),
+            "top": np.array([0.0, 0.045, 0.005], dtype=float),
+            "left": np.array([0.045, 0.0, 0.005], dtype=float),
+            "right": np.array([-0.005, 0.0, 0.045], dtype=float),
+            "back": np.array([0.040, 0.0, 0.050], dtype=float),
         }
         return measured_offsets.get(face_name, fallback)
 
@@ -1019,7 +1145,7 @@ class MultiCharucoDetectorNode(Node):
     def publish_cube_transforms(self, image_msg: Image, ok_boards: list):
         """検出できた面からキューブTFを発信し、キャッシュを更新する。
 
-        同じキューブの複数面が同時に見えることがあるので、最も信頼できる
+        同じキューブの複数面が同時に見えることがあるので、カメラに近い
         1面だけを使ってキューブごとに1つのTFを出す。
         """
         best_by_cube = {}
@@ -1028,10 +1154,7 @@ class MultiCharucoDetectorNode(Node):
             cube_frame = result["config"]["cube_frame"]
             current = best_by_cube.get(cube_frame)
 
-            if (
-                current is None
-                or self.pose_quality(result) > self.pose_quality(current)
-            ):
+            if current is None or self.pose_priority(result) > self.pose_priority(current):
                 best_by_cube[cube_frame] = result
 
         transforms = []
@@ -1044,6 +1167,16 @@ class MultiCharucoDetectorNode(Node):
 
             if not camera_link_frame:
                 continue
+
+            self.get_logger().info(
+                f"Using {cube_frame}:{result['face_name']} for "
+                f"{camera_link_frame} "
+                f"(distance={self.pose_distance_m(result):.3f} m, "
+                f"source={result.get('pose_source')}, "
+                f"corners={result.get('num_corners', 0)}, "
+                f"markers={result.get('num_markers', 0)})",
+                throttle_duration_sec=1.0,
+            )
 
             rvec_camera_link, t_camera_link = self.pose_in_camera_from_face(
                 config,
@@ -1082,6 +1215,8 @@ class MultiCharucoDetectorNode(Node):
                 self.static_tf_broadcaster.sendTransform(camera_link_transforms)
             self.save_world_camera_transforms(camera_link_transforms)
 
+        return camera_link_transforms
+
     def front_frame_for_cube(self, cube_frame: str):
         return f"{cube_frame}_front"
 
@@ -1101,9 +1236,15 @@ class MultiCharucoDetectorNode(Node):
         )
 
     @staticmethod
-    def pose_quality(result: dict):
-        """ChArUcoコーナー解を優先し、次にコーナー数・マーカー数で比べる。"""
+    def pose_distance_m(result: dict):
+        return float(np.linalg.norm(result["tvec"].flatten()))
+
+    @staticmethod
+    def pose_priority(result: dict):
+        """カメラに近い面を優先し、同距離なら検出品質で比べる。"""
+        distance_m = MultiCharucoDetectorNode.pose_distance_m(result)
         return (
+            -distance_m,
             1 if result.get("pose_source") == "chessboard" else 0,
             result.get("num_corners", 0),
             result.get("num_markers", 0),
@@ -1331,14 +1472,18 @@ class MultiCharucoDetectorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MultiCharucoDetectorNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
-
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

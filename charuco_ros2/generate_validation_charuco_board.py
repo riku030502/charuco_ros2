@@ -14,6 +14,17 @@ from charuco_ros2.charuco_board_utils import (
 )
 
 
+VALIDATION_SQUARE_LENGTH_MM = 20.0
+VALIDATION_MARKER_LENGTH_MM = 14.0
+
+DEFAULT_OUTPUT_DIR = (
+    Path(__file__).resolve().parent
+    / "boards"
+    / "generated"
+    / "validation_charuco"
+)
+
+
 def mm_to_px(mm: float, dpi: int, minimum: int = 0) -> int:
     px = int(round(float(mm) / 25.4 * int(dpi)))
     return max(minimum, px)
@@ -83,12 +94,12 @@ def parse_args():
     parser.add_argument(
         "--square-length-mm",
         type=float,
-        default=m_to_mm(CUBE_CHARUCO_DEFAULTS["square_length_m"]),
+        default=VALIDATION_SQUARE_LENGTH_MM,
     )
     parser.add_argument(
         "--marker-length-mm",
         type=float,
-        default=m_to_mm(CUBE_CHARUCO_DEFAULTS["marker_length_m"]),
+        default=VALIDATION_MARKER_LENGTH_MM,
     )
     parser.add_argument(
         "--dictionary",
@@ -104,7 +115,11 @@ def parse_args():
     parser.add_argument("--margin-mm", type=float, default=5.0)
     parser.add_argument(
         "--output-dir",
-        default="boards/generated/validation_charuco",
+        default=None,
+        help=(
+            "Output directory. Defaults to "
+            f"{DEFAULT_OUTPUT_DIR} instead of the current working directory."
+        ),
     )
     parser.add_argument("--output-prefix", default=None)
     parser.add_argument("--no-label", action="store_true")
@@ -124,7 +139,11 @@ def main():
     )
     config = validate_board_config(config)
 
-    output_dir = Path(args.output_dir).expanduser()
+    output_dir = (
+        DEFAULT_OUTPUT_DIR
+        if args.output_dir is None
+        else Path(args.output_dir).expanduser()
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ids = config["marker_ids"]

@@ -8,6 +8,11 @@ def generate_launch_description():
     board_config_path = LaunchConfiguration("board_config_path")
     base_frame = LaunchConfiguration("base_frame")
     csv_path = LaunchConfiguration("csv_path")
+    validation_side = LaunchConfiguration("validation_side")
+    pre_validation_move_enabled = LaunchConfiguration(
+        "pre_validation_move_enabled"
+    )
+    allow_marker_only_pose = LaunchConfiguration("allow_marker_only_pose")
 
     ext_image_topic = LaunchConfiguration("ext_image_topic")
     ext_camera_info_topic = LaunchConfiguration("ext_camera_info_topic")
@@ -24,6 +29,15 @@ def generate_launch_description():
             DeclareLaunchArgument("board_config_path", default_value=""),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
             DeclareLaunchArgument("csv_path", default_value=""),
+            DeclareLaunchArgument("validation_side", default_value="left"),
+            DeclareLaunchArgument(
+                "pre_validation_move_enabled",
+                default_value="true",
+            ),
+            DeclareLaunchArgument(
+                "allow_marker_only_pose",
+                default_value="false",
+            ),
             DeclareLaunchArgument(
                 "ext_image_topic",
                 default_value="/left_camera/color/image_raw",
@@ -66,6 +80,7 @@ def generate_launch_description():
                         "parent_frame": ext_parent_frame,
                         "output_frame_id": ext_output_frame_id,
                         "pose_topic": "/charuco_validation/ext_pose",
+                        "allow_marker_only_pose": allow_marker_only_pose,
                         "debug_image_topic": (
                             "/charuco_validation/ext_debug_image"
                         ),
@@ -85,6 +100,7 @@ def generate_launch_description():
                         "parent_frame": hand_parent_frame,
                         "output_frame_id": hand_output_frame_id,
                         "pose_topic": "/charuco_validation/hand_pose",
+                        "allow_marker_only_pose": allow_marker_only_pose,
                         "debug_image_topic": (
                             "/charuco_validation/hand_debug_image"
                         ),
@@ -96,13 +112,20 @@ def generate_launch_description():
                 executable="charuco_pose_comparator",
                 name="charuco_pose_comparator",
                 output="screen",
+                emulate_tty=True,
                 parameters=[
                     {
-                        "input_mode": "tf",
+                        "input_mode": "topics",
                         "base_frame": base_frame,
                         "ext_target_frame": ext_output_frame_id,
                         "hand_target_frame": hand_output_frame_id,
+                        "ext_pose_topic": "/charuco_validation/ext_pose",
+                        "hand_pose_topic": "/charuco_validation/hand_pose",
                         "csv_path": csv_path,
+                        "validation_side": validation_side,
+                        "pre_validation_move_enabled": (
+                            pre_validation_move_enabled
+                        ),
                     }
                 ],
             ),

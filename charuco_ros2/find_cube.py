@@ -8,11 +8,13 @@ import yaml
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
+from std_srvs.srv import SetBool
 from tf2_ros import (
     Buffer,
     ConnectivityException,
@@ -34,6 +36,11 @@ class FindCubeNode(Node):
             "/camera/hand_camera/aligned_depth_to_color/image_raw",
         )
         self.declare_parameter("debug_image_topic", "/find_cube/debug_image")
+        self.declare_parameter(
+            "detection_enable_service_name",
+            "/find_cube/set_detection_enabled",
+        )
+        self.declare_parameter("detection_enabled", True)
         self.declare_parameter("parent_frame", "")
         self.declare_parameter("right_child_frame", "right_cube_color_frame")
         self.declare_parameter("left_child_frame", "left_cube_color_frame")
@@ -64,7 +71,7 @@ class FindCubeNode(Node):
         self.declare_parameter("depth_sample_radius", 3)
         self.declare_parameter("depth_scale", 0.001)
         self.declare_parameter("min_depth_m", 0.05)
-        self.declare_parameter("max_depth_m", 5.0)
+        self.declare_parameter("max_depth_m", 0.75)
         # 距離推定に使う、実物の色付き正方形フレームの一辺の長さ[m]。
         # 画像上の見かけの大きさ(pixel_size)とこの実寸から、カメラまでの距離を計算する。
         self.declare_parameter("frame_size_m", 0.05)
@@ -83,6 +90,12 @@ class FindCubeNode(Node):
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         self.depth_image_topic = self.get_parameter("depth_image_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
+        self.detection_enable_service_name = self.get_parameter(
+            "detection_enable_service_name"
+        ).value
+        self.detection_enabled = bool(
+            self.get_parameter("detection_enabled").value
+        )
         self.parent_frame = self.get_parameter("parent_frame").value
         self.right_child_frame = self.get_parameter("right_child_frame").value
         self.left_child_frame = self.get_parameter("left_child_frame").value
@@ -157,21 +170,21 @@ class FindCubeNode(Node):
             CameraInfo,
             self.camera_info_topic,
             self.camera_info_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
         self.image_sub = self.create_subscription(
             Image,
             self.image_topic,
             self.image_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
         self.depth_image_sub = self.create_subscription(
             Image,
             self.depth_image_topic,
             self.depth_image_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
         self.debug_pub = self.create_publisher(
@@ -179,12 +192,22 @@ class FindCubeNode(Node):
             self.debug_image_topic,
             10,
         )
+        self.detection_enable_service = self.create_service(
+            SetBool,
+            self.detection_enable_service_name,
+            self.handle_detection_enabled,
+        )
 
         self.get_logger().info("find_cube node started")
         self.get_logger().info(f"image_topic: {self.image_topic}")
         self.get_logger().info(f"camera_info_topic: {self.camera_info_topic}")
         self.get_logger().info(f"depth_image_topic: {self.depth_image_topic}")
         self.get_logger().info(f"debug_image_topic: {self.debug_image_topic}")
+        self.get_logger().info(
+            f"detection_enable_service_name: "
+            f"{self.detection_enable_service_name}, "
+            f"detection_enabled={self.detection_enabled}"
+        )
         self.get_logger().info(f"parent_frame: {self.parent_frame or '<image header>'}")
         self.get_logger().info(f"right_child_frame: {self.right_child_frame}")
         self.get_logger().info(f"left_child_frame: {self.left_child_frame}")
@@ -234,6 +257,14 @@ class FindCubeNode(Node):
         self.cx = msg.k[2]
         self.cy = msg.k[5]
 
+    def handle_detection_enabled(self, request, response):
+        self.detection_enabled = bool(request.data)
+        state = "enabled" if self.detection_enabled else "disabled"
+        response.success = True
+        response.message = f"find_cube detection {state}"
+        self.get_logger().info(response.message)
+        return response
+
     def depth_image_callback(self, msg: Image):
         try:
             depth_image = self.bridge.imgmsg_to_cv2(
@@ -247,6 +278,9 @@ class FindCubeNode(Node):
         self.latest_depth_image = depth_image
 
     def image_callback(self, msg: Image):
+        if not self.detection_enabled:
+            return
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except CvBridgeError as error:
@@ -332,7 +366,7 @@ class FindCubeNode(Node):
             if split is not None:
                 return split
 
-            self.get_logger().warn(
+            self.get_logger().debug(
                 "Falling back to image-side classification: no detection has a "
                 f"{self.base_frame} position yet (CameraInfo, depth, or the "
                 f"{self.base_frame} TF may be missing).",
@@ -421,14 +455,14 @@ class FindCubeNode(Node):
             # 面積が小さい輪郭は、遠方の誤検出や照明ノイズである可能性が高い。
             area = cv2.contourArea(contour)
             if area < self.min_contour_area:
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f"contour rejected: area={area:.0f} < {self.min_contour_area}",
                     throttle_duration_sec=1.0,
                 )
                 continue
 
             if area > self.max_contour_area:
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f"contour rejected: area={area:.0f} > {self.max_contour_area}",
                     throttle_duration_sec=1.0,
                 )
@@ -449,7 +483,7 @@ class FindCubeNode(Node):
             # 細い線、円弧、欠けた領域は値が低くなるのでここで除外する。
             rectangularity = area / rot_area
             if rectangularity < self.min_rectangularity:
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f"contour rejected: rect={rectangularity:.2f} < {self.min_rectangularity}",
                     throttle_duration_sec=1.0,
                 )
@@ -463,7 +497,7 @@ class FindCubeNode(Node):
                 rect = cv2.minAreaRect(approx)
                 w, h = rect[1]
                 aspect = (max(w, h) / min(w, h)) if min(w, h) > 0 else 999
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f"contour rejected: vertices={len(approx)} aspect={aspect:.2f}",
                     throttle_duration_sec=1.0,
                 )
@@ -517,6 +551,18 @@ class FindCubeNode(Node):
             if distance_m is None and self.fallback_to_size_distance:
                 distance_m = self.get_size_distance(detection)
                 source = "size"
+
+            if (
+                distance_m is not None
+                and float(distance_m) > float(self.max_depth_m)
+            ):
+                self.get_logger().debug(
+                    f"color frame rejected: distance={distance_m:.3f} m "
+                    f"> {float(self.max_depth_m):.3f} m",
+                    throttle_duration_sec=1.0,
+                )
+                distance_m = None
+                source = None
 
             detection["distance_m"] = distance_m
             detection["distance_source"] = source if distance_m is not None else None

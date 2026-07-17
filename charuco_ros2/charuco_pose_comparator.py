@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import csv
+import math
 import os
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -12,6 +14,17 @@ from rclpy.time import Time
 from scipy.spatial.transform import Rotation as R
 from tf2_ros import Buffer, ConnectivityException, ExtrapolationException
 from tf2_ros import LookupException, TransformListener
+
+try:
+    from xarm_utils_py import XArmUtils
+    from xarm_utils_py import Node as XArmNode
+except ImportError:
+    XArmUtils = None
+    XArmNode = None
+
+
+PRE_VALIDATION_LEFT_JOINT_DEGREES = [48.0, 0.0, -77.0, 0.0, 77.0, 0.0]
+PRE_VALIDATION_RIGHT_JOINT_DEGREES = [-48.0, 0.0, -77.0, 0.0, 77.0, 0.0]
 
 
 class CharucoPoseComparatorNode(Node):
@@ -45,6 +58,18 @@ class CharucoPoseComparatorNode(Node):
         self.declare_parameter("lookup_timeout", 0.05)
         self.declare_parameter("max_pose_age_sec", 2.0)
         self.declare_parameter("csv_path", "")
+        self.declare_parameter("pre_validation_move_enabled", True)
+        self.declare_parameter("validation_side", "left")
+        self.declare_parameter("move_group_name", "xarm6")
+        self.declare_parameter("move_group_ready_timeout", 10.0)
+        self.declare_parameter(
+            "pre_validation_left_joint_degrees",
+            PRE_VALIDATION_LEFT_JOINT_DEGREES,
+        )
+        self.declare_parameter(
+            "pre_validation_right_joint_degrees",
+            PRE_VALIDATION_RIGHT_JOINT_DEGREES,
+        )
 
         self.input_mode = self.get_parameter("input_mode").value
         self.base_frame = self.get_parameter("base_frame").value
@@ -60,6 +85,22 @@ class CharucoPoseComparatorNode(Node):
         self.csv_path = os.path.expanduser(
             self.get_parameter("csv_path").value
         )
+        self.pre_validation_move_enabled = bool(
+            self.get_parameter("pre_validation_move_enabled").value
+        )
+        self.validation_side = (
+            self.get_parameter("validation_side").value.lower()
+        )
+        self.move_group_name = self.get_parameter("move_group_name").value
+        self.move_group_ready_timeout = float(
+            self.get_parameter("move_group_ready_timeout").value
+        )
+        self.pre_validation_left_joint_degrees = list(
+            self.get_parameter("pre_validation_left_joint_degrees").value
+        )
+        self.pre_validation_right_joint_degrees = list(
+            self.get_parameter("pre_validation_right_joint_degrees").value
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -68,6 +109,8 @@ class CharucoPoseComparatorNode(Node):
 
         if self.input_mode not in ("tf", "topics"):
             raise ValueError("input_mode must be 'tf' or 'topics'")
+        if self.validation_side not in ("left", "right"):
+            raise ValueError("validation_side must be 'left' or 'right'")
 
         if self.input_mode == "topics":
             self.ext_sub = self.create_subscription(
@@ -86,6 +129,8 @@ class CharucoPoseComparatorNode(Node):
         if self.csv_path:
             self.ensure_csv_header()
 
+        self.prepare_validation_start()
+
         self.timer = self.create_timer(
             1.0 / self.compare_rate,
             self.compare_once,
@@ -99,6 +144,112 @@ class CharucoPoseComparatorNode(Node):
         )
         if self.csv_path:
             self.get_logger().info(f"csv_path: {self.csv_path}")
+
+    def prepare_validation_start(self):
+        if not self.pre_validation_move_enabled:
+            self.get_logger().info(
+                "Pre-validation xArm move is disabled; starting comparison"
+            )
+            return
+
+        joints_deg = self.get_pre_validation_joint_degrees()
+        success, message = self.move_xarm_for_validation(joints_deg)
+        if success:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
+
+        prompt = (
+            "\n"
+            "xArm pre-validation pose for "
+            f"{self.validation_side} is requested.\n"
+            "Place/check the validation ChArUco board, then press Enter to "
+            "start comparison..."
+        )
+        try:
+            input(prompt)
+        except EOFError:
+            self.get_logger().warn(
+                "stdin is not available; starting comparison without Enter"
+            )
+
+    def get_pre_validation_joint_degrees(self):
+        if self.validation_side == "left":
+            joints = self.pre_validation_left_joint_degrees
+        else:
+            joints = self.pre_validation_right_joint_degrees
+
+        if len(joints) == 5:
+            joints = list(joints) + [0.0]
+        if len(joints) != 6:
+            raise ValueError(
+                "pre-validation joint target must contain 5 or 6 values"
+            )
+        return [float(value) for value in joints]
+
+    def move_xarm_for_validation(self, joints_deg):
+        if XArmUtils is None or XArmNode is None:
+            return (
+                False,
+                "xarm_utils_py is not available; cannot move xArm before "
+                "validation",
+            )
+
+        joints_rad = [math.radians(value) for value in joints_deg]
+        if not self.wait_for_move_group_parameter_service():
+            return (
+                False,
+                "MoveIt move_group parameter service is not available: "
+                "/move_group/get_parameters",
+            )
+
+        try:
+            xarm_node = XArmNode("charuco_validation_xarm_utils")
+            xarm = XArmUtils(xarm_node, self.move_group_name)
+            self.get_logger().info(
+                "Setting pre-validation MoveGroup target: "
+                f"side={self.validation_side}, joints_deg={joints_deg}"
+            )
+            if not xarm.set_joint_value_target(joints_rad):
+                return False, "MoveGroup rejected the pre-validation target"
+
+            self.get_logger().info("Planning pre-validation xArm motion")
+            plan_success, _, duration, error_code = xarm.plan()
+            if not plan_success:
+                return (
+                    False,
+                    "MoveGroup planning failed for pre-validation pose: "
+                    f"error_code={getattr(error_code, 'val', None)}, "
+                    f"duration={duration:.3f}s",
+                )
+
+            self.get_logger().info(
+                "Pre-validation plan succeeded in "
+                f"{duration:.3f}s; executing"
+            )
+            if not xarm.execute():
+                return (
+                    False,
+                    "MoveGroup execute failed for pre-validation pose",
+                )
+            self.get_logger().info("Pre-validation xArm execute completed")
+        except Exception as error:
+            return False, f"Pre-validation xArm move failed: {error}"
+
+        return (
+            True,
+            "Moved xArm to pre-validation pose: "
+            f"side={self.validation_side}, joints_deg={joints_deg}",
+        )
+
+    def wait_for_move_group_parameter_service(self):
+        deadline = time.monotonic() + max(self.move_group_ready_timeout, 0.0)
+        while time.monotonic() <= deadline:
+            for service_name, _ in self.get_service_names_and_types():
+                if service_name == "/move_group/get_parameters":
+                    return True
+            time.sleep(0.1)
+        return False
 
     def ext_pose_callback(self, msg: PoseStamped):
         self.ext_pose = msg
@@ -131,7 +282,11 @@ class CharucoPoseComparatorNode(Node):
         self.get_logger().info(
             "ChArUco validation error: "
             f"translation={translation_error_mm:.2f} mm, "
-            f"rotation={rotation_error_deg:.3f} deg",
+            f"rotation={rotation_error_deg:.3f} deg, "
+            f"delta_xyz_ext_minus_hand=["
+            f"{delta_t[0] * 1000.0:.1f}, "
+            f"{delta_t[1] * 1000.0:.1f}, "
+            f"{delta_t[2] * 1000.0:.1f}] mm",
             throttle_duration_sec=1.0,
         )
 

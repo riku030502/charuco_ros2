@@ -125,6 +125,14 @@ ros2 run charuco_ros2 apriltag_detector
 ros2 run charuco_ros2 multi_cube_charuco_detector
 ```
 
+起動中は保存済み `world -> *_camera_link` TFを配信し続ける。画像検出は
+CPU負荷を抑えるため既定では常時回さず、Triggerサービスを呼んだときだけ
+`detection_window_sec` 秒間実行する。
+
+```bash
+ros2 service call /multi_cube_charuco_detector/detect_once std_srvs/srv/Trigger
+```
+
 ### 配信するTF
 
 - 面のTF `*_charuco`（例: `left_cube_front_charuco`）
@@ -137,8 +145,8 @@ ros2 run charuco_ros2 multi_cube_charuco_detector
   - 起動時は `world_camera_tfs.json` の保存値を配信する。
   - ChArUco検出時は、検出面 -> front -> camera_link で求めた
     `world -> *_camera_link` を再配信し、`world_camera_tfs.json` に保存する。
-  - 同じキューブの複数面が同時に見えたときは、最も信頼できる1面だけを使う。
-    ChArUcoコーナー解を優先し、次にコーナー数・マーカー数で選ぶ。
+  - 同じキューブの複数面が同時に見えたときは、カメラに近い1面だけを使う。
+    同距離ならChArUcoコーナー解、次にコーナー数・マーカー数で選ぶ。
 
 ### world基準のカメラリンクTFも配信する
 
@@ -217,17 +225,18 @@ ros2 launch realsense2_camera rs_launch.py \
 外部カメラと校正済みハンドカメラから同じ検証用ChArUcoボードを観測し、
 それぞれの `base_link -> target` を比較する暫定チェック用ノード群。
 
-検証用ボードを生成する。既定値は既存キューブと同じ
-4x4 / square 10 mm / marker 7 mm / `DICT_4X4_100` で、既存キューブの
+検証用ボードを生成する。既定値はハンドカメラでも安定して読めるように
+4x4 / square 20 mm / marker 14 mm / `DICT_4X4_100` で、既存キューブの
 ID `0-79` と衝突しないように `80-87` を使う。
 
 ```bash
 ros2 run charuco_ros2 generate_validation_charuco_board
 ```
 
-生成物は既定で `boards/generated/validation_charuco/` に保存される。
+生成物は既定で `charuco_ros2/boards/generated/validation_charuco/` に保存される。
 PNG/PDFを印刷し、同時に出るYAMLまたはJSONを検出ノードの
-`board_config_path` に渡す。
+`board_config_path` に渡す。`board_config_path` が `charuco_ros2/` で始まる
+相対パスの場合、検出ノードは実行ディレクトリではなくパッケージ内パスとして解決する。
 
 単体検出ノード:
 
@@ -235,7 +244,7 @@ PNG/PDFを印刷し、同時に出るYAMLまたはJSONを検出ノードの
 ros2 run charuco_ros2 charuco_target_detector --ros-args \
   -p image_topic:=/left_camera/color/image_raw \
   -p camera_info_topic:=/left_camera/color/camera_info \
-  -p board_config_path:=boards/generated/validation_charuco/validation_charuco_4x4_square10mm_marker7mm_id80-87_300dpi.yaml \
+  -p board_config_path:=charuco_ros2/boards/generated/validation_charuco/validation_charuco_4x4_square20mm_marker14mm_id80-87_300dpi.yaml \
   -p output_frame_id:=target_pose_ext_left \
   -p pose_topic:=/charuco_validation/ext_pose
 ```
@@ -247,7 +256,7 @@ ros2 run charuco_ros2 charuco_target_detector --ros-args \
 
 ```bash
 ros2 launch charuco_ros2 charuco_target_validation.launch.py \
-  board_config_path:=boards/generated/validation_charuco/validation_charuco_4x4_square10mm_marker7mm_id80-87_300dpi.yaml \
+  board_config_path:=charuco_ros2/boards/generated/validation_charuco/validation_charuco_4x4_square20mm_marker14mm_id80-87_300dpi.yaml \
   ext_image_topic:=/left_camera/color/image_raw \
   ext_camera_info_topic:=/left_camera/color/camera_info \
   ext_output_frame_id:=target_pose_ext_left \
@@ -255,13 +264,20 @@ ros2 launch charuco_ros2 charuco_target_validation.launch.py \
   hand_camera_info_topic:=/camera/hand_camera/color/camera_info \
   hand_output_frame_id:=target_pose_hand \
   base_frame:=base_link \
+  validation_side:=left \
   csv_path:=/tmp/charuco_validation_left.csv
 ```
 
-比較ノードは `base_frame -> target_pose_ext_left` と
-`base_frame -> target_pose_hand` をtf2でlookupし、並進誤差[mm]と
+比較ノードは `/charuco_validation/ext_pose` と
+`/charuco_validation/hand_pose` を `base_frame` へ変換し、並進誤差[mm]と
 回転誤差[deg]をログ出力する。`csv_path` を指定すると表IIの集計に使える
-CSVを追記する。
+CSVを追記する。検証ターゲットTFの古い時刻で外挿エラーになるのを避けるため、
+launch既定ではPoseStamped topic同士を比較する。
+
+比較を始める前に、`validation_side:=left` なら
+`[48, 0, -77, 0, 77, 0]` deg、`validation_side:=right` なら
+`[-48, 0, -77, 0, 77, 0]` degへMoveGroup経由で移動する。その後、
+端末でEnterを押すと比較とCSV追記が始まる。
 
 ## キューブへの移動（`move_to_charuco`）
 
@@ -273,17 +289,17 @@ ros2 service call /move_to_charuco/cube_left std_srvs/srv/Trigger "{}"
 ```
 
 `execution_mode:=sim` は、MoveItの `/compute_ik` サービスでポーズを解き、
-得られた関節角を `xarm6_traj_controller` へ送る。
+得られた関節角を MoveGroup (`xarm_utils_py`) の `set_joint_value_target()` →
+`plan()` → `execute()` で実行する。
 
 ### simとrealを一致させる（`real_use_moveit_ik`、既定 `true`）
 
-`execution_mode:=real` も同じ `/compute_ik` を呼び、関節角をxArmの
-`set_servo_angle` サービスへ送る。IKの分岐も動きも、simで見たものと一致する。
+`execution_mode:=real` も同じ `/compute_ik` を呼び、得られた関節角をMoveGroupの
+`plan()` → `execute()` で実行する。IKの分岐も実行経路も、simで見たものと一致する。
 
-`real_use_moveit_ik:=false` にした場合、あるいは `/compute_ik` が見つからず
-フォールバックした場合は、ポーズがxArmの `set_position` サービスへ渡される。
-このとき**IKを解くのはxArmのファームウェア**であり、分岐も経路も向こうが決める
-ため、動きはsimと**一致しない**。フォールバックしたときは警告をログに出す。
+`real_use_moveit_ik` は後方互換のため残しているが、現在は `false` にしても
+xArmの `set_position` サービスへはフォールバックしない。planningまたはexecuteが
+失敗した場合、サービス応答は非0の `ret` を返す。
 
 `cartesian_max_target_distance_m` は両モードで同じ値を渡すこと。この値は目標位置
 そのものを変えるので、違う値では同じポーズを比較していることにならない。
