@@ -474,11 +474,21 @@ class MoveToCharucoPoseNode(Node):
             self.handle_right_cube_move_request,
             callback_group=self.callback_group,
         )
+        self.pre_marker_server = self.create_service(
+            Trigger,
+            self.server_service_name + "/pre_marker",
+            self.handle_pre_marker_move_request,
+            callback_group=self.callback_group,
+        )
 
         self.get_logger().info(
             f"Services ready: {self.server_service_name} | "
             f"{self.server_service_name}/left | {self.server_service_name}/right "
             f"(angles unit: {self.input_unit})"
+        )
+        self.get_logger().info(
+            "Pre-marker return service ready: "
+            f"{self.server_service_name}/pre_marker"
         )
         self.get_logger().info(
             f"execution_mode={self.execution_mode}, "
@@ -726,12 +736,12 @@ class MoveToCharucoPoseNode(Node):
             for value in self.pre_marker_joint_degrees
         ]
 
-    def move_to_pre_marker_pose(self):
-        if not self.prepare_before_marker_move:
+    def move_to_pre_marker_pose(self, force=False):
+        if not force and not self.prepare_before_marker_move:
             return True, 0, "pre-marker move disabled"
 
         self.get_logger().info(
-            "Moving to pre-marker pose before executing the requested target"
+            "Moving to pre-marker pose"
         )
         return self.move_joints_with_moveit(
             self.get_pre_marker_positions_rad(),
@@ -796,6 +806,23 @@ class MoveToCharucoPoseNode(Node):
     def handle_right_cube_move_request(self, request, response):
         del request
         return self._handle_cube_move_request("right", response)
+
+    def handle_pre_marker_move_request(self, request, response):
+        """Return the arm to the shared pre-marker joint pose."""
+        del request
+        self.set_find_cube_detection_enabled(False, required=False)
+        success, ret, message = self.move_to_pre_marker_pose(force=True)
+        if success:
+            return self.set_trigger_response(
+                response,
+                True,
+                "returned to pre-marker pose",
+            )
+        return self.set_trigger_response(
+            response,
+            False,
+            f"return to pre-marker pose failed: ret={ret}, {message}",
+        )
 
     def _handle_cube_move_request(self, side, response):
         self.set_find_cube_detection_enabled(False, required=False)

@@ -3,14 +3,17 @@ import cv2
 import json
 import numpy as np
 import os
+import re
 import threading
 import time
 
 import rclpy
+from rcl_interfaces.srv import GetParameters, SetParametersAtomically
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -36,6 +39,26 @@ from charuco_ros2.charuco_board_utils import (
 )
 
 
+def parse_video_profile(profile):
+    """Return width, height, and fps from a RealSense video profile."""
+    parts = re.split(r"[xX,]", str(profile))
+    if len(parts) != 3:
+        raise ValueError(
+            f"video profile must be WIDTHxHEIGHTxFPS, got '{profile}'"
+        )
+    try:
+        width, height, fps = (int(part.strip()) for part in parts)
+    except ValueError as error:
+        raise ValueError(
+            f"video profile must contain integers, got '{profile}'"
+        ) from error
+    if width < 0 or height < 0 or fps < 0:
+        raise ValueError(
+            f"video profile values must not be negative, got '{profile}'"
+        )
+    return width, height, fps
+
+
 class MultiCharucoDetectorNode(Node):
     def __init__(self):
         super().__init__("multi_cube_charuco_detector_node")
@@ -52,6 +75,24 @@ class MultiCharucoDetectorNode(Node):
         )
         self.declare_parameter("detection_window_sec", 2.0)
         self.declare_parameter("detect_continuously", False)
+        self.declare_parameter(
+            "manage_color_profile_for_detection",
+            False,
+        )
+        self.declare_parameter(
+            "realsense_node_name",
+            "/camera/hand_camera",
+        )
+        self.declare_parameter(
+            "detection_color_profile",
+            "1280x720x30",
+        )
+        self.declare_parameter("color_profile_switch_timeout_sec", 15.0)
+        self.declare_parameter("color_profile_settle_sec", 1.0)
+        self.declare_parameter(
+            "restore_color_profile_after_detection",
+            True,
+        )
 
         self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
 
@@ -114,6 +155,40 @@ class MultiCharucoDetectorNode(Node):
         self.detect_continuously = bool(
             self.get_parameter("detect_continuously").value
         )
+        self.manage_color_profile_for_detection = bool(
+            self.get_parameter(
+                "manage_color_profile_for_detection"
+            ).value
+        )
+        self.realsense_node_name = self._normalise_node_name(
+            self.get_parameter("realsense_node_name").value
+        )
+        self.detection_color_profile = str(
+            self.get_parameter("detection_color_profile").value
+        )
+        self.detection_profile = parse_video_profile(
+            self.detection_color_profile
+        )
+        self.detection_profile_size = self.detection_profile[:2]
+        self.color_profile_switch_timeout_sec = float(
+            self.get_parameter(
+                "color_profile_switch_timeout_sec"
+            ).value
+        )
+        self.color_profile_settle_sec = float(
+            self.get_parameter("color_profile_settle_sec").value
+        )
+        self.restore_color_profile_after_detection = bool(
+            self.get_parameter(
+                "restore_color_profile_after_detection"
+            ).value
+        )
+        if self.color_profile_switch_timeout_sec <= 0.0:
+            raise ValueError(
+                "color_profile_switch_timeout_sec must be positive"
+            )
+        if self.color_profile_settle_sec < 0.0:
+            raise ValueError("color_profile_settle_sec must be non-negative")
 
         self.parent_frame = self.get_parameter("parent_frame").value
 
@@ -344,7 +419,10 @@ class MultiCharucoDetectorNode(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.camera_info_received = False
+        self.camera_info_width = 0
+        self.camera_info_height = 0
         self.camera_info_event = threading.Event()
+        self.camera_info_condition = threading.Condition()
         self.detection_lock = threading.Lock()
         self.detection_active_until = 0.0
         self.detection_success_event = threading.Event()
@@ -354,6 +432,17 @@ class MultiCharucoDetectorNode(Node):
         # ROS
         # =========================
         self.callback_group = ReentrantCallbackGroup()
+        parameter_service_prefix = self.realsense_node_name.rstrip("/")
+        self.realsense_get_parameters_client = self.create_client(
+            GetParameters,
+            f"{parameter_service_prefix}/get_parameters",
+            callback_group=self.callback_group,
+        )
+        self.realsense_set_parameters_client = self.create_client(
+            SetParametersAtomically,
+            f"{parameter_service_prefix}/set_parameters_atomically",
+            callback_group=self.callback_group,
+        )
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -400,6 +489,14 @@ class MultiCharucoDetectorNode(Node):
             f"detect_service_name: {self.detect_service_name}, "
             f"detection_window_sec={self.detection_window_sec:.1f}, "
             f"detect_continuously={self.detect_continuously}"
+        )
+        self.get_logger().info(
+            "temporary detection color profile: "
+            f"enabled={self.manage_color_profile_for_detection}, "
+            f"profile={self.detection_color_profile}, "
+            f"realsense_node={self.realsense_node_name}, "
+            "restore_after_detection="
+            f"{self.restore_color_profile_after_detection}"
         )
         self.get_logger().info(f"parent_frame: {self.parent_frame}")
         self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
@@ -470,25 +567,44 @@ class MultiCharucoDetectorNode(Node):
             )
 
     def camera_info_callback(self, msg: CameraInfo):
-        if self.camera_info_received:
-            return
+        camera_matrix = np.array(
+            msg.k,
+            dtype=np.float64,
+        ).reshape(3, 3)
+        dist_coeffs = np.array(msg.d, dtype=np.float64)
 
-        self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-        self.dist_coeffs = np.array(msg.d, dtype=np.float64)
+        with self.camera_info_condition:
+            unchanged = (
+                self.camera_info_received
+                and self.camera_info_width == int(msg.width)
+                and self.camera_info_height == int(msg.height)
+                and np.array_equal(self.camera_matrix, camera_matrix)
+                and np.array_equal(self.dist_coeffs, dist_coeffs)
+            )
+            if unchanged:
+                return
 
-        # 各ChArUcoDetectorにカメラ内部パラメータを設定する
-        for entry in self.board_entries:
-            charuco_detector = entry["charuco_detector"]
+            self.camera_matrix = camera_matrix
+            self.dist_coeffs = dist_coeffs
+            self.camera_info_width = int(msg.width)
+            self.camera_info_height = int(msg.height)
 
-            charuco_params = charuco_detector.getCharucoParameters()
-            charuco_params.cameraMatrix = self.camera_matrix
-            charuco_params.distCoeffs = self.dist_coeffs
-            charuco_detector.setCharucoParameters(charuco_params)
+            # 解像度変更後も、各Detectorへ新しい内部パラメータを反映する。
+            for entry in self.board_entries:
+                charuco_detector = entry["charuco_detector"]
+                charuco_params = charuco_detector.getCharucoParameters()
+                charuco_params.cameraMatrix = self.camera_matrix
+                charuco_params.distCoeffs = self.dist_coeffs
+                charuco_detector.setCharucoParameters(charuco_params)
 
-        self.camera_info_received = True
-        self.camera_info_event.set()
+            self.camera_info_received = True
+            self.camera_info_event.set()
+            self.camera_info_condition.notify_all()
 
-        self.get_logger().info("CameraInfo received")
+        self.get_logger().info(
+            f"CameraInfo updated: "
+            f"{self.camera_info_width}x{self.camera_info_height}"
+        )
         self.get_logger().info(f"camera_matrix:\n{self.camera_matrix}")
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
 
@@ -500,51 +616,233 @@ class MultiCharucoDetectorNode(Node):
             response.message = "detection_window_sec must be positive"
             return response
 
-        if not self.camera_info_received:
+        original_color_state = None
+        try:
+            if self.manage_color_profile_for_detection:
+                original_color_state = (
+                    self.prepare_detection_color_profile()
+                )
+
+            if not self.camera_info_received:
+                self.get_logger().info(
+                    "Waiting for CameraInfo before starting cube detection"
+                )
+                self.camera_info_event.wait(
+                    timeout=min(self.detection_window_sec, 2.0)
+                )
+
+            if not self.camera_info_received:
+                raise RuntimeError("timed out waiting for CameraInfo")
+
+            with self.detection_lock:
+                self.latest_detection_message = ""
+                self.detection_success_event.clear()
+                self.detection_active_until = (
+                    time.monotonic() + self.detection_window_sec
+                )
+
             self.get_logger().info(
-                "Waiting for CameraInfo before starting cube detection"
+                f"Cube ChArUco detection enabled for "
+                f"{self.detection_window_sec:.1f}s at "
+                f"{self.camera_info_width}x{self.camera_info_height}"
             )
-            self.camera_info_event.wait(timeout=min(self.detection_window_sec, 2.0))
 
-        if not self.camera_info_received:
+            detected = self.detection_success_event.wait(
+                timeout=self.detection_window_sec
+            )
+
+            with self.detection_lock:
+                message = self.latest_detection_message
+                self.detection_active_until = 0.0
+
+            if detected:
+                response.success = True
+                response.message = (
+                    message or "cube ChArUco detection succeeded"
+                )
+                self.get_logger().info(response.message)
+            else:
+                response.success = False
+                response.message = (
+                    message
+                    or f"no cube ChArUco pose detected in "
+                    f"{self.detection_window_sec:.1f}s"
+                )
+                self.get_logger().warn(response.message)
+        except RuntimeError as error:
             response.success = False
-            response.message = "timed out waiting for CameraInfo"
+            response.message = str(error)
             self.get_logger().warn(response.message)
-            return response
+        finally:
+            with self.detection_lock:
+                self.detection_active_until = 0.0
+            if (
+                original_color_state is not None
+                and self.restore_color_profile_after_detection
+            ):
+                try:
+                    self.restore_color_profile(original_color_state)
+                except RuntimeError as error:
+                    restore_message = (
+                        f"failed to restore RealSense color profile: {error}"
+                    )
+                    response.success = False
+                    if response.message:
+                        response.message += f"; {restore_message}"
+                    else:
+                        response.message = restore_message
+                    self.get_logger().error(restore_message)
+        return response
 
-        with self.detection_lock:
-            self.latest_detection_message = ""
-            self.detection_success_event.clear()
-            self.detection_active_until = (
-                time.monotonic() + self.detection_window_sec
+    @staticmethod
+    def _normalise_node_name(node_name):
+        value = str(node_name).strip()
+        if not value:
+            raise ValueError("realsense_node_name must not be empty")
+        return f"/{value.strip('/')}"
+
+    def prepare_detection_color_profile(self):
+        """Switch the RealSense color stream to the detection profile."""
+        state = self.get_realsense_color_state()
+        current_profile = state["profile"]
+        current_enabled = state["enabled"]
+        target_profile = self.detection_profile
+        target_size = self.detection_profile_size
+        current_profile_values = parse_video_profile(current_profile)
+
+        if current_enabled and current_profile_values == target_profile:
+            self.get_logger().info(
+                "RealSense color stream already uses detection profile "
+                f"{current_profile}"
             )
+            return None
 
         self.get_logger().info(
-            f"Cube ChArUco detection enabled for "
-            f"{self.detection_window_sec:.1f}s"
+            f"Temporarily switching RealSense color profile from "
+            f"{current_profile} to {self.detection_color_profile}"
         )
-
-        detected = self.detection_success_event.wait(
-            timeout=self.detection_window_sec
-        )
-
-        with self.detection_lock:
-            message = self.latest_detection_message
-            self.detection_active_until = 0.0
-
-        if detected:
-            response.success = True
-            response.message = message or "cube ChArUco detection succeeded"
-            self.get_logger().info(response.message)
-        else:
-            response.success = False
-            response.message = (
-                message
-                or f"no cube ChArUco pose detected in "
-                f"{self.detection_window_sec:.1f}s"
+        try:
+            self.apply_realsense_color_state(
+                self.detection_color_profile,
+                True,
             )
-            self.get_logger().warn(response.message)
+            self.wait_for_camera_info_size(*target_size)
+            if self.color_profile_settle_sec > 0.0:
+                time.sleep(self.color_profile_settle_sec)
+        except RuntimeError:
+            try:
+                self.apply_realsense_color_state(
+                    current_profile,
+                    current_enabled,
+                )
+            except RuntimeError as rollback_error:
+                self.get_logger().error(
+                    "Could not roll back RealSense color profile after "
+                    f"switch failure: {rollback_error}"
+                )
+            raise
+        return state
+
+    def restore_color_profile(self, state):
+        """Restore the RealSense color stream state used before detection."""
+        profile = state["profile"]
+        enabled = state["enabled"]
+        self.get_logger().info(
+            f"Restoring RealSense color profile to {profile}"
+        )
+        self.apply_realsense_color_state(profile, enabled)
+        width, height, _fps = parse_video_profile(profile)
+        if enabled and width > 0 and height > 0:
+            self.wait_for_camera_info_size(width, height)
+
+    def get_realsense_color_state(self):
+        request = GetParameters.Request()
+        request.names = [
+            "rgb_camera.color_profile",
+            "enable_color",
+        ]
+        response = self.call_parameter_service(
+            self.realsense_get_parameters_client,
+            request,
+            "reading RealSense color parameters",
+        )
+        if len(response.values) != 2:
+            raise RuntimeError(
+                "RealSense returned an unexpected parameter response"
+            )
+        profile_value, enabled_value = response.values
+        if profile_value.type != Parameter.Type.STRING.value:
+            raise RuntimeError(
+                "RealSense rgb_camera.color_profile is not a string"
+            )
+        if enabled_value.type != Parameter.Type.BOOL.value:
+            raise RuntimeError("RealSense enable_color is not a boolean")
+        return {
+            "profile": profile_value.string_value,
+            "enabled": enabled_value.bool_value,
+        }
+
+    def apply_realsense_color_state(self, profile, enabled):
+        """Apply a profile by disabling and re-enabling the color stream."""
+        self.set_realsense_parameter("enable_color", False)
+        self.set_realsense_parameter(
+            "rgb_camera.color_profile",
+            str(profile),
+        )
+        self.set_realsense_parameter("enable_color", bool(enabled))
+
+    def set_realsense_parameter(self, name, value):
+        request = SetParametersAtomically.Request()
+        request.parameters = [
+            Parameter(name, value=value).to_parameter_msg()
+        ]
+        response = self.call_parameter_service(
+            self.realsense_set_parameters_client,
+            request,
+            f"setting RealSense parameter {name}",
+        )
+        if not response.result.successful:
+            reason = response.result.reason or "parameter was rejected"
+            raise RuntimeError(f"could not set {name}: {reason}")
+
+    def call_parameter_service(self, client, request, operation):
+        timeout = self.color_profile_switch_timeout_sec
+        if not client.wait_for_service(timeout_sec=timeout):
+            raise RuntimeError(
+                f"{operation}: parameter service for "
+                f"{self.realsense_node_name} is unavailable"
+            )
+        future = client.call_async(request)
+        event = threading.Event()
+        future.add_done_callback(lambda _future: event.set())
+        if not event.wait(timeout=timeout):
+            raise RuntimeError(f"timed out while {operation}")
+        exception = future.exception()
+        if exception is not None:
+            raise RuntimeError(f"{operation} failed: {exception}")
+        response = future.result()
+        if response is None:
+            raise RuntimeError(f"{operation} returned no response")
         return response
+
+    def wait_for_camera_info_size(self, width, height):
+        deadline = (
+            time.monotonic() + self.color_profile_switch_timeout_sec
+        )
+        with self.camera_info_condition:
+            while (
+                self.camera_info_width != int(width)
+                or self.camera_info_height != int(height)
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for CameraInfo "
+                        f"{width}x{height}; latest was "
+                        f"{self.camera_info_width}x"
+                        f"{self.camera_info_height}"
+                    )
+                self.camera_info_condition.wait(timeout=remaining)
 
     def detection_is_active(self):
         if self.detect_continuously:

@@ -181,17 +181,27 @@ IDの復号には**1セルあたり4〜5 px**が目安になる。1セルあた�
 | 1280x720 | 936 | 7.3 px | **5.5 px** | 3.6 px |
 | 1920x1080 | 1404 | 10.9 px | 8.2 px | 5.5 px |
 
-424x240では復号限界を下回っており、検出は安定しない。ハンドカメラは
-**1280x720以上**で動かすこと。
+424x240では復号限界を下回っており、検出は安定しない。
+`argus octomap_charuco_workflow.launch.py` から起動した場合は、最終姿勢で
+ChArUco検出サービスを実行している間だけ、カラーストリームを
+`1280x720x30`へ切り替える。検出後は成功・失敗にかかわらず、元の
+プロファイルへ戻す。
+
+RealSense ROSではプロファイル変更後にストリームの再有効化が必要なため、
+検出器は `enable_color=false`、プロファイル変更、`enable_color=true` の
+順で更新し、1280x720の新しい`camera_info`を受け取ってから検出を始める。
+
+この動作はlaunch引数で変更できる。
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py \
-  camera_name:=hand_camera \
-  rgb_camera.color_profile:=1280x720x30
+ros2 launch argus octomap_charuco_workflow.launch.py \
+  manage_detection_color_profile:=true \
+  realsense_node_name:=/camera/hand_camera \
+  detection_color_profile:=1280x720x30
 ```
 
-`camera_info` が実際に変わったか確認すること。`fx` が310のままなら、
-プロファイルの指定が効いていない。
+ログに `CameraInfo updated: 1280x720` が出ず、`fx` が310のままなら、
+RealSenseノード名または対応プロファイルを確認すること。
 
 マーカーを大きくする方向では解決しない。424x240のまま0.20 mで復号するには
 19.4 mmのマーカー、つまり110 mmのボードが要るが、50 mmのキューブ面には載らない。
@@ -286,6 +296,12 @@ launch既定ではPoseStamped topic同士を比較する。
 ```bash
 ros2 run charuco_ros2 move_to_charuco --ros-args -p execution_mode:=sim
 ros2 service call /move_to_charuco/cube_left std_srvs/srv/Trigger "{}"
+```
+
+pre-marker姿勢 `[0, -15, 0, 0, -90, 0]` degへ戻す専用サービス:
+
+```bash
+ros2 service call /move_to_charuco/pre_marker std_srvs/srv/Trigger "{}"
 ```
 
 `execution_mode:=sim` は、MoveItの `/compute_ik` サービスでポーズを解き、

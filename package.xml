@@ -17,6 +17,7 @@
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>xarm_msgs</exec_depend>
   <exec_depend>xarm_utils_cpp</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
