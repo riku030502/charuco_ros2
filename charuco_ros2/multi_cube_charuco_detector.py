@@ -35,6 +35,7 @@ from scipy.spatial.transform import Rotation as R
 
 from charuco_ros2.charuco_board_utils import (
     CUBE_CHARUCO_DEFAULTS,
+    filter_markers_by_ids,
     get_aruco_dictionary,
 )
 
@@ -57,6 +58,54 @@ def parse_video_profile(profile):
             f"video profile values must not be negative, got '{profile}'"
         )
     return width, height, fps
+
+
+def robust_average_pose(translations, quaternions, max_rot_deg, max_trans_m):
+    """複数フレームの姿勢から外れ値を除いて平均する。
+
+    小さい平面ボードのIPPEは2解が拮抗し、フレームによって20度以上離れた
+    別解へ飛ぶことがある。回転はメドイド（他サンプルとの角度差の和が最小の
+    サンプル）、並進は成分ごとの中央値を基準にして、そこから外れたサンプルを
+    除いてから平均する。
+
+    translations: (N, 3) [m]、quaternions: (N, 4) xyzw。
+    戻り値は (translation(3,), quaternion xyzw(4,), inlier_mask(N,), stats)。
+    """
+    translations = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
+    rotations = R.from_quat(
+        np.asarray(quaternions, dtype=np.float64).reshape(-1, 4)
+    )
+    count = len(translations)
+
+    pairwise_deg = np.array([
+        np.degrees((rotations[i].inv() * rotations).magnitude())
+        for i in range(count)
+    ])
+    medoid = int(np.argmin(pairwise_deg.sum(axis=1)))
+    rot_err_deg = pairwise_deg[medoid]
+    trans_err_m = np.linalg.norm(
+        translations - np.median(translations, axis=0),
+        axis=1,
+    )
+
+    inliers = (rot_err_deg <= max_rot_deg) & (trans_err_m <= max_trans_m)
+    if not np.any(inliers):
+        inliers[medoid] = True
+
+    mean_rotation = rotations[inliers].mean()
+    mean_translation = translations[inliers].mean(axis=0)
+
+    residual_deg = np.degrees(
+        (mean_rotation.inv() * rotations[inliers]).magnitude()
+    )
+    residual_m = np.linalg.norm(translations[inliers] - mean_translation, axis=1)
+    stats = {
+        "num_samples": count,
+        "num_inliers": int(np.count_nonzero(inliers)),
+        "rot_rms_deg": float(np.sqrt(np.mean(residual_deg ** 2))),
+        "trans_rms_m": float(np.sqrt(np.mean(residual_m ** 2))),
+    }
+    return mean_translation, mean_rotation.as_quat(), inliers, stats
 
 
 class MultiCharucoDetectorNode(Node):
@@ -93,6 +142,18 @@ class MultiCharucoDetectorNode(Node):
             "restore_color_profile_after_detection",
             True,
         )
+
+        # =========================
+        # Multi-frame averaging (detect_once)
+        # =========================
+        # 1フレームの単発推定をそのまま保存すると、PnPのばらつきや2解の
+        # 取り違えがそのまま較正誤差になる。detect_once では、移動直後の
+        # 振動が収まるまで待ってから複数フレームを集め、外れ値を除いて平均する。
+        self.declare_parameter("detection_settle_sec", 0.5)
+        self.declare_parameter("pose_sample_count", 15)
+        self.declare_parameter("min_pose_samples", 5)
+        self.declare_parameter("pose_outlier_rot_deg", 3.0)
+        self.declare_parameter("pose_outlier_trans_m", 0.01)
 
         self.declare_parameter("parent_frame", "hand_camera_color_optical_frame")
 
@@ -189,6 +250,25 @@ class MultiCharucoDetectorNode(Node):
             )
         if self.color_profile_settle_sec < 0.0:
             raise ValueError("color_profile_settle_sec must be non-negative")
+
+        self.detection_settle_sec = max(
+            float(self.get_parameter("detection_settle_sec").value),
+            0.0,
+        )
+        self.pose_sample_count = max(
+            int(self.get_parameter("pose_sample_count").value),
+            1,
+        )
+        self.min_pose_samples = min(
+            max(int(self.get_parameter("min_pose_samples").value), 1),
+            self.pose_sample_count,
+        )
+        self.pose_outlier_rot_deg = float(
+            self.get_parameter("pose_outlier_rot_deg").value
+        )
+        self.pose_outlier_trans_m = float(
+            self.get_parameter("pose_outlier_trans_m").value
+        )
 
         self.parent_frame = self.get_parameter("parent_frame").value
 
@@ -425,8 +505,11 @@ class MultiCharucoDetectorNode(Node):
         self.camera_info_condition = threading.Condition()
         self.detection_lock = threading.Lock()
         self.detection_active_until = 0.0
+        self.detection_settle_until = None
         self.detection_success_event = threading.Event()
         self.latest_detection_message = ""
+        # camera_link frame -> world基準TransformStampedのリスト
+        self.pose_samples = {}
 
         # =========================
         # ROS
@@ -497,6 +580,12 @@ class MultiCharucoDetectorNode(Node):
             f"realsense_node={self.realsense_node_name}, "
             "restore_after_detection="
             f"{self.restore_color_profile_after_detection}"
+        )
+        self.get_logger().info(
+            f"pose averaging: settle={self.detection_settle_sec:.2f}s, "
+            f"samples={self.min_pose_samples}-{self.pose_sample_count}, "
+            f"outlier rot>{self.pose_outlier_rot_deg:.1f}deg "
+            f"trans>{self.pose_outlier_trans_m * 1000.0:.1f}mm"
         )
         self.get_logger().info(f"parent_frame: {self.parent_frame}")
         self.get_logger().info(f"board: {self.squares_x}x{self.squares_y}")
@@ -634,26 +723,42 @@ class MultiCharucoDetectorNode(Node):
             if not self.camera_info_received:
                 raise RuntimeError("timed out waiting for CameraInfo")
 
+            total_wait_sec = self.detection_window_sec
+            if not self.detect_continuously:
+                total_wait_sec += self.detection_settle_sec
+
             with self.detection_lock:
                 self.latest_detection_message = ""
+                self.pose_samples = {}
                 self.detection_success_event.clear()
-                self.detection_active_until = (
-                    time.monotonic() + self.detection_window_sec
+                # Reject queued motion frames and allow vibration to settle.
+                self.detection_settle_until = (
+                    self.get_clock().now()
+                    + Duration(seconds=self.detection_settle_sec)
                 )
+                self.detection_active_until = time.monotonic() + total_wait_sec
 
             self.get_logger().info(
                 f"Cube ChArUco detection enabled for "
-                f"{self.detection_window_sec:.1f}s at "
+                f"{total_wait_sec:.1f}s at "
                 f"{self.camera_info_width}x{self.camera_info_height}"
             )
 
             detected = self.detection_success_event.wait(
-                timeout=self.detection_window_sec
+                timeout=total_wait_sec
             )
 
             with self.detection_lock:
                 message = self.latest_detection_message
                 self.detection_active_until = 0.0
+                pose_samples = self.pose_samples
+                self.pose_samples = {}
+
+            if not self.detect_continuously:
+                detected, message = self.commit_averaged_poses(
+                    pose_samples,
+                    message,
+                )
 
             if detected:
                 response.success = True
@@ -850,6 +955,95 @@ class MultiCharucoDetectorNode(Node):
         with self.detection_lock:
             return time.monotonic() <= self.detection_active_until
 
+    def frame_is_settled(self, image_msg: Image):
+        if self.detect_continuously:
+            return True
+        with self.detection_lock:
+            settle_until = self.detection_settle_until
+        if settle_until is None:
+            return True
+        return Time.from_msg(image_msg.header.stamp) >= settle_until
+
+    def add_pose_samples(self, camera_link_transforms):
+        """detect_once の窓内で camera_link 姿勢を溜める。十分集まったら通知。"""
+        with self.detection_lock:
+            for transform in camera_link_transforms:
+                self.pose_samples.setdefault(
+                    transform.child_frame_id, []
+                ).append(transform)
+            enough = any(
+                len(samples) >= self.pose_sample_count
+                for samples in self.pose_samples.values()
+            )
+        if enough:
+            self.detection_success_event.set()
+
+    def commit_averaged_poses(self, pose_samples: dict, fallback_message: str):
+        """溜めた姿勢を平均して静的TF配信・保存する。(成功, メッセージ)を返す。"""
+        averaged = []
+        summaries = []
+        rejected = []
+
+        for child_frame_id, samples in sorted(pose_samples.items()):
+            if len(samples) < self.min_pose_samples:
+                rejected.append(
+                    f"{child_frame_id}: only {len(samples)} frame(s) "
+                    f"(< {self.min_pose_samples})"
+                )
+                continue
+
+            translations = []
+            quaternions = []
+            for sample in samples:
+                translation, rotation = self.transform_to_pose(sample)
+                translations.append(translation)
+                quaternions.append(rotation.as_quat())
+
+            mean_t, mean_q, _, stats = robust_average_pose(
+                translations,
+                quaternions,
+                self.pose_outlier_rot_deg,
+                self.pose_outlier_trans_m,
+            )
+            summary = (
+                f"{child_frame_id}: {stats['num_inliers']}/"
+                f"{stats['num_samples']} frames, "
+                f"rot_rms={stats['rot_rms_deg']:.3f}deg, "
+                f"trans_rms={stats['trans_rms_m'] * 1000.0:.2f}mm"
+            )
+            if stats["num_inliers"] < self.min_pose_samples:
+                rejected.append(f"{summary} (too few inliers)")
+                continue
+
+            latest = samples[-1]
+            averaged.append(
+                self.create_transform(
+                    latest.header.stamp,
+                    latest.header.frame_id,
+                    child_frame_id,
+                    mean_t,
+                    mean_q,
+                )
+            )
+            summaries.append(summary)
+
+        for text in rejected:
+            self.get_logger().warn(f"Camera link TF not updated; {text}")
+
+        if not averaged:
+            if rejected:
+                return False, "no camera_link TF updated; " + "; ".join(rejected)
+            return False, fallback_message
+
+        self.commit_camera_link_transforms(averaged)
+        message = (
+            "cube ChArUco detection succeeded; averaged TF(s): "
+            + "; ".join(summaries)
+        )
+        if rejected:
+            message += "; skipped: " + "; ".join(rejected)
+        return True, message
+
     def notify_detection_success(self, message):
         with self.detection_lock:
             self.latest_detection_message = message
@@ -864,6 +1058,9 @@ class MultiCharucoDetectorNode(Node):
                 "Waiting for CameraInfo...",
                 throttle_duration_sec=2.0,
             )
+            return
+
+        if not self.frame_is_settled(msg):
             return
 
         try:
@@ -908,6 +1105,8 @@ class MultiCharucoDetectorNode(Node):
                 gray=gray,
                 image_msg=msg,
                 debug_frame=debug_frame,
+                all_marker_corners=all_marker_corners,
+                all_marker_ids=all_marker_ids,
             )
 
             if result is not None:
@@ -929,6 +1128,13 @@ class MultiCharucoDetectorNode(Node):
 
         camera_link_transforms = self.publish_cube_transforms(msg, ok_boards)
 
+        if not self.detect_continuously:
+            # detect_once: ここでは溜めるだけ。平均と保存は窓の終了時に行う。
+            if camera_link_transforms:
+                self.add_pose_samples(camera_link_transforms)
+        elif camera_link_transforms:
+            self.commit_camera_link_transforms(camera_link_transforms)
+
         if ok_boards:
             board_text = ", ".join(
                 [
@@ -946,10 +1152,11 @@ class MultiCharucoDetectorNode(Node):
                     transform.child_frame_id
                     for transform in camera_link_transforms
                 )
-                self.notify_detection_success(
-                    f"cube ChArUco detection succeeded; updated TF(s): "
-                    f"{child_frames}; boards={board_text}"
-                )
+                if self.detect_continuously:
+                    self.notify_detection_success(
+                        f"cube ChArUco detection succeeded; updated TF(s): "
+                        f"{child_frames}; boards={board_text}"
+                    )
             else:
                 with self.detection_lock:
                     self.latest_detection_message = (
@@ -973,18 +1180,35 @@ class MultiCharucoDetectorNode(Node):
         gray,
         image_msg: Image,
         debug_frame,
+        all_marker_corners,
+        all_marker_ids,
     ):
         """1つのboard configについて検出と姿勢推定を試す。"""
 
         config = entry["config"]
         charuco_detector = entry["charuco_detector"]
 
+        # 画像全体で1回だけ検出したマーカーから、このboardのIDだけを渡す。
+        # 他boardのマーカーを混ぜるとOpenCV 4.8がIDを取り違えてコーナーを
+        # 補間しなくなる（filter_markers_by_ids参照）。
+        face_marker_corners, face_marker_ids = filter_markers_by_ids(
+            all_marker_corners,
+            all_marker_ids,
+            entry["marker_ids"],
+        )
+        if face_marker_ids is None:
+            return None
+
         # =========================
         # Detect ChArUco board
         # =========================
         try:
             charuco_corners, charuco_ids, marker_corners, marker_ids = (
-                charuco_detector.detectBoard(gray)
+                charuco_detector.detectBoard(
+                    gray,
+                    markerCorners=face_marker_corners,
+                    markerIds=face_marker_ids,
+                )
             )
         except cv2.error as e:
             self.get_logger().debug(
@@ -1441,10 +1665,11 @@ class MultiCharucoDetectorNode(Node):
         return T
 
     def publish_cube_transforms(self, image_msg: Image, ok_boards: list):
-        """検出できた面からキューブTFを発信し、キャッシュを更新する。
+        """検出できた面から面間TFを発信し、world基準のcamera_link TFを返す。
 
-        同じキューブの複数面が同時に見えることがあるので、カメラに近い
-        1面だけを使ってキューブごとに1つのTFを出す。
+        同じキューブの複数面が同時に見えることがあるので、検出品質の最も
+        高い1面だけを使ってキューブごとに1つのTFを出す。静的TFの配信と
+        キャッシュ保存は commit_camera_link_transforms が行う。
         """
         best_by_cube = {}
 
@@ -1508,12 +1733,14 @@ class MultiCharucoDetectorNode(Node):
         if transforms:
             self.tf_broadcaster.sendTransform(transforms)
 
-        if camera_link_transforms:
-            if self.publish_camera_link_from_cube_tf:
-                self.static_tf_broadcaster.sendTransform(camera_link_transforms)
-            self.save_world_camera_transforms(camera_link_transforms)
-
         return camera_link_transforms
+
+    def commit_camera_link_transforms(self, camera_link_transforms):
+        if not camera_link_transforms:
+            return
+        if self.publish_camera_link_from_cube_tf:
+            self.static_tf_broadcaster.sendTransform(camera_link_transforms)
+        self.save_world_camera_transforms(camera_link_transforms)
 
     def front_frame_for_cube(self, cube_frame: str):
         return f"{cube_frame}_front"
@@ -1539,13 +1766,17 @@ class MultiCharucoDetectorNode(Node):
 
     @staticmethod
     def pose_priority(result: dict):
-        """カメラに近い面を優先し、同距離なら検出品質で比べる。"""
+        """検出品質の高い面を優先し、同品質ならカメラに近い面を選ぶ。
+
+        数cm近いだけのマーカー角PnPより、ChArUcoコーナーを多く使えた面の
+        方が姿勢精度はずっと高い。
+        """
         distance_m = MultiCharucoDetectorNode.pose_distance_m(result)
         return (
-            -distance_m,
             1 if result.get("pose_source") == "chessboard" else 0,
             result.get("num_corners", 0),
             result.get("num_markers", 0),
+            -distance_m,
         )
 
     def cube_target_pose_in_camera(self, config: dict, rvec, tvec):

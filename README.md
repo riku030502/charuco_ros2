@@ -127,11 +127,28 @@ ros2 run charuco_ros2 multi_cube_charuco_detector
 
 起動中は保存済み `world -> *_camera_link` TFを配信し続ける。画像検出は
 CPU負荷を抑えるため既定では常時回さず、Triggerサービスを呼んだときだけ
-`detection_window_sec` 秒間実行する。
+`detection_settle_sec` + `detection_window_sec` 秒間実行する。
 
 ```bash
 ros2 service call /multi_cube_charuco_detector/detect_once std_srvs/srv/Trigger
 ```
+
+`detect_once` は1フレームの単発推定を保存しない。サービス呼び出し時刻から
+`detection_settle_sec` 以内に撮られたフレーム（移動直後の振動中の画像）を捨て、
+その後の `camera_link` 姿勢を最大 `pose_sample_count` フレーム集める。回転の
+メドイド・並進の中央値から `pose_outlier_rot_deg` / `pose_outlier_trans_m` を
+超えて外れたフレーム（IPPEの別解への飛びなど）を除いて平均し、inlierが
+`min_pose_samples` 以上あるときだけ配信・保存する。応答メッセージに
+inlier数と残差RMSが入る。`detect_continuously:=true` のときは従来どおり
+フレームごとに更新する。
+
+| パラメータ | 既定値 | 説明 |
+|---|---|---|
+| `detection_settle_sec` | 0.5 | 呼び出し後、この時間内に撮られたフレームを捨てる [s] |
+| `pose_sample_count` | 15 | このフレーム数集まったら窓の終了を待たずに確定 |
+| `min_pose_samples` | 5 | 平均に必要な最小inlierフレーム数 |
+| `pose_outlier_rot_deg` | 3.0 | 回転の外れ値しきい値 [deg] |
+| `pose_outlier_trans_m` | 0.01 | 並進の外れ値しきい値 [m] |
 
 ### 配信するTF
 
@@ -145,8 +162,13 @@ ros2 service call /multi_cube_charuco_detector/detect_once std_srvs/srv/Trigger
   - 起動時は `world_camera_tfs.json` の保存値を配信する。
   - ChArUco検出時は、検出面 -> front -> camera_link で求めた
     `world -> *_camera_link` を再配信し、`world_camera_tfs.json` に保存する。
-  - 同じキューブの複数面が同時に見えたときは、カメラに近い1面だけを使う。
-    同距離ならChArUcoコーナー解、次にコーナー数・マーカー数で選ぶ。
+  - 同じキューブの複数面が同時に見えたときは、検出品質の最も高い1面だけを
+    使う。ChArUcoコーナー解を優先し、次にコーナー数・マーカー数、最後に
+    カメラとの距離で選ぶ。
+  - 各面の `detectBoard` には、その面のIDのマーカーだけを渡す。OpenCV 4.8 は
+    他面のマーカーIDが自面のマーカー番号（0〜7）と同じ値だと取り違え、
+    コーナーを1点も補間しなくなる（left_cubeのfront ID 0〜7が写ると他面が
+    マーカー角のみの低精度解に落ちていた）。
 
 ### world基準のカメラリンクTFも配信する
 

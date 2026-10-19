@@ -59,6 +59,35 @@ def get_aruco_dictionary(dictionary: str):
     )
 
 
+def filter_markers_by_ids(marker_corners, marker_ids, board_ids):
+    """検出マーカーから、指定boardのIDだけを取り出す。
+
+    OpenCV 4.8 の CharucoDetector.detectBoard は、他boardのマーカーのIDが
+    自boardのマーカー番号(0〜N-1)と同じ値だと取り違え、ChArUcoコーナーを
+    1点も補間しなくなる（left_cubeのfront ID 0-7が写るだけで他面が全滅する）。
+    detectBoardへは自boardのマーカーだけを渡すこと。
+
+    戻り値は (corners_tuple, ids_Nx1) か、該当なしなら (None, None)。
+    """
+    if marker_ids is None or len(marker_ids) == 0:
+        return None, None
+
+    board_id_set = {int(marker_id) for marker_id in np.asarray(board_ids).flatten()}
+    flat_ids = np.asarray(marker_ids).flatten()
+    selected = [
+        index
+        for index, marker_id in enumerate(flat_ids)
+        if int(marker_id) in board_id_set
+    ]
+    if not selected:
+        return None, None
+
+    return (
+        tuple(marker_corners[index] for index in selected),
+        flat_ids[selected].reshape(-1, 1).astype(np.int32),
+    )
+
+
 def dictionary_capacity(dictionary: str) -> int | None:
     name = normalize_dictionary_name(dictionary)
     try:
