@@ -110,3 +110,46 @@ def test_pose_camera_model_guard():
     other = K.copy()
     other[0, 0] = 905.0
     assert not camera_model_matches(model, 1920, 1080, other)
+
+
+def _write(directory, name, text):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    return path
+
+
+def test_cube_calibration_file_is_inverted_and_validated():
+    from charuco_ros2.multi_cube_charuco_detector import load_cube_calibrations
+    rotation = cv2.Rodrigues(np.radians([1.0, 0.4, 0.0]))[0] @ np.array(
+        [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
+    )
+    front_T_left = np.eye(4)
+    front_T_left[:3, :3] = rotation
+    front_T_left[:3, 3] = [-0.0049, -0.0008, 0.0450]
+    rows = "\n".join(f"- [{', '.join(repr(float(v)) for v in row)}]" for row in front_T_left)
+    with tempfile.TemporaryDirectory() as directory:
+        header = "cube_id: left_cube\nface: left\nfront_T_left:\n"
+        good = _write(directory, "a.yaml", f"{header}{rows}\n")
+        result = load_cube_calibrations([good, ""])
+        np.testing.assert_allclose(
+            result[("left_cube", "left")]["T_face_front"] @ front_T_left, np.eye(4), atol=1e-12
+        )
+        assert load_cube_calibrations([""]) == {}
+        for text in (
+            f"cube_id: left_cube\nface: front\nfront_T_front:\n{rows}\n",
+            f"cube_id: other_cube\nface: left\nfront_T_left:\n{rows}\n",
+            "cube_id: left_cube\nface: left\nfront_T_left: [[2, 0, 0, 0], [0, 1, 0, 0], "
+            "[0, 0, 1, 0], [0, 0, 0, 1]]\n",
+        ):
+            bad = _write(directory, "bad.yaml", text)
+            try:
+                load_cube_calibrations([bad])
+            except ValueError:
+                continue
+            raise AssertionError(f"accepted invalid calibration: {text[:40]}")
+        try:
+            load_cube_calibrations([good, good])
+        except ValueError:
+            return
+        raise AssertionError("duplicate calibration accepted")

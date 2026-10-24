@@ -73,6 +73,43 @@ def load_pose_camera_model(path):
     return model
 
 
+def load_cube_calibrations(paths):
+    """キューブ個体校正ファイルを読む。{(cube_id, face): {...}} を返す。
+
+    ファイルの front_T_<face> は face ボード座標をfrontボード座標へ写す
+    変換（列ベクトル、m）。ノード内部の T_front_in_face（face_T_front）は
+    その逆行列。同じ cube_id/face が重複したら失敗させる。
+    """
+    calibrations = {}
+    for path in [str(value) for value in (paths or []) if str(value).strip()]:
+        with open(path, "r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream)
+        cube_id = str(data["cube_id"])
+        face = str(data["face"])
+        if cube_id not in ("left_cube", "right_cube"):
+            raise ValueError(f"unknown cube_id '{cube_id}' in {path}")
+        if face not in ("left", "right", "back", "top"):
+            raise ValueError(f"face '{face}' cannot be calibrated in {path}")
+        matrix = np.asarray(data[f"front_T_{face}"], dtype=np.float64)
+        if matrix.shape != (4, 4):
+            raise ValueError(f"front_T_{face} must be 4x4 in {path}")
+        rotation = matrix[:3, :3]
+        if (
+            not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+            or np.linalg.det(rotation) <= 0.0
+            or not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0])
+        ):
+            raise ValueError(f"front_T_{face} is not a rigid transform in {path}")
+        key = (cube_id, face)
+        if key in calibrations:
+            raise ValueError(f"duplicate calibration for {cube_id}:{face}")
+        calibrations[key] = {
+            "T_face_front": np.linalg.inv(matrix),
+            "source": f"calibration {os.path.basename(path)}",
+        }
+    return calibrations
+
+
 def camera_model_matches(model, width, height, camera_info_k, tolerance=1e-3):
     """モデルが受信CameraInfo（解像度とK）に対応するか。"""
     return (
@@ -232,6 +269,9 @@ class MultiCharucoDetectorNode(Node):
         # pose_camera_model_file を指定すると、姿勢推定にそのK/Dを使う
         # （検出の角点補間はCameraInfoのまま）。CameraInfoやserialが一致しない
         # ときは pose_camera_model_mismatch に従う（fail: 検出を失敗させる）。
+        # キューブ個体校正ファイル（ARGUS Plan025形式のYAML）のリスト。
+        # 記載された cube_id/face だけ設計値の代わりに実測 front_T_face を使う。
+        self.declare_parameter("cube_calibration_files", [""])
         self.declare_parameter("pose_pipeline", "legacy")
         self.declare_parameter("pose_camera_model_file", "")
         self.declare_parameter("pose_camera_model_mismatch", "fail")
@@ -496,14 +536,29 @@ class MultiCharucoDetectorNode(Node):
         ]
 
         T_camera_link_in_front = self._compute_T_camera_link_in_front()
+        calibrations = load_cube_calibrations(
+            self.get_parameter("cube_calibration_files").value
+        )
 
         # 各面ボード座標系からfront/camera_link相当への変換行列を計算して追加
+        # 個体校正ファイルがある面はその実測値、それ以外は設計値を使う。
         for config in self.board_id_configs:
-            config["T_front_in_face"] = self._compute_T_front_in_face(
-                config["face_name"], self.cube_size
-            )
+            key = (config["cube_name"], config["face_name"])
+            if key in calibrations:
+                config["T_front_in_face"] = calibrations[key]["T_face_front"]
+                config["face_transform_source"] = calibrations[key]["source"]
+            else:
+                config["T_front_in_face"] = self._compute_T_front_in_face(
+                    config["face_name"], self.cube_size
+                )
+                config["face_transform_source"] = "design"
             config["T_camera_link_in_face"] = (
                 config["T_front_in_face"] @ T_camera_link_in_front
+            )
+        for config in self.board_id_configs:
+            self.get_logger().info(
+                f"face transform {config['cube_name']}:{config['face_name']}: "
+                f"{config['face_transform_source']}"
             )
 
         # =========================
