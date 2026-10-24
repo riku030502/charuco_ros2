@@ -33,11 +33,53 @@ from tf2_ros import (
 
 from scipy.spatial.transform import Rotation as R
 
+import yaml
+
 from charuco_ros2.charuco_board_utils import (
     CUBE_CHARUCO_DEFAULTS,
     filter_markers_by_ids,
     get_aruco_dictionary,
 )
+from charuco_ros2.robust_charuco import RobustCharucoDetector
+
+POSE_PIPELINES = ("legacy", "b6_p1_ippe_lm")
+POSE_MODEL_MISMATCH_ACTIONS = ("fail", "camera_info")
+
+
+def load_pose_camera_model(path):
+    """検出・姿勢推定用カメラモデル（K/D）をYAMLから読む。
+
+    必須: name, width, height, K(3x3), D, camera_info_k(3x3)。
+    camera_info_k は、このモデルを推定したときのCameraInfoのK。受信した
+    CameraInfoと一致しない（別カメラ・別解像度）場合はモデルを適用しない。
+    serial_no があればRealSenseノードのserial_noとも照合する。
+    """
+    with open(path, "r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream)
+    model = {
+        "name": str(data["name"]),
+        "width": int(data["width"]),
+        "height": int(data["height"]),
+        "K": np.asarray(data["K"], dtype=np.float64).reshape(3, 3),
+        "D": np.asarray(data["D"], dtype=np.float64).reshape(-1),
+        "camera_info_k": np.asarray(
+            data["camera_info_k"], dtype=np.float64
+        ).reshape(3, 3),
+        "serial_no": str(data.get("serial_no", "")).strip("'\" "),
+        "source": str(data.get("source", "")),
+    }
+    if model["width"] <= 0 or model["height"] <= 0:
+        raise ValueError(f"invalid size in camera model {path}")
+    return model
+
+
+def camera_model_matches(model, width, height, camera_info_k, tolerance=1e-3):
+    """モデルが受信CameraInfo（解像度とK）に対応するか。"""
+    return (
+        model["width"] == int(width)
+        and model["height"] == int(height)
+        and np.allclose(model["camera_info_k"], camera_info_k, atol=tolerance)
+    )
 
 
 def parse_video_profile(profile):
@@ -183,6 +225,16 @@ class MultiCharucoDetectorNode(Node):
         # マーカー1個につき4点得られる。
         self.declare_parameter("allow_marker_only_pose", True)
         self.declare_parameter("min_markers_for_pose", 2)
+        # pose_pipeline:
+        #   legacy        従来処理（等倍検出・IPPE・マーカー角fallbackあり）
+        #   b6_p1_ippe_lm ARGUS Plan014/015/021/023で検証した処理（robust_charuco）。
+        #                 品質ゲートを通らない面は姿勢として使わない。
+        # pose_camera_model_file を指定すると、姿勢推定にそのK/Dを使う
+        # （検出の角点補間はCameraInfoのまま）。CameraInfoやserialが一致しない
+        # ときは pose_camera_model_mismatch に従う（fail: 検出を失敗させる）。
+        self.declare_parameter("pose_pipeline", "legacy")
+        self.declare_parameter("pose_camera_model_file", "")
+        self.declare_parameter("pose_camera_model_mismatch", "fail")
 
         # =========================
         # World camera link TF
@@ -283,6 +335,33 @@ class MultiCharucoDetectorNode(Node):
         self.min_markers_for_pose = int(
             self.get_parameter("min_markers_for_pose").value
         )
+        self.pose_pipeline = str(self.get_parameter("pose_pipeline").value)
+        if self.pose_pipeline not in POSE_PIPELINES:
+            raise ValueError(
+                f"pose_pipeline must be one of {POSE_PIPELINES}, "
+                f"got '{self.pose_pipeline}'"
+            )
+        self.pose_camera_model_mismatch = str(
+            self.get_parameter("pose_camera_model_mismatch").value
+        )
+        if self.pose_camera_model_mismatch not in POSE_MODEL_MISMATCH_ACTIONS:
+            raise ValueError(
+                "pose_camera_model_mismatch must be one of "
+                f"{POSE_MODEL_MISMATCH_ACTIONS}"
+            )
+        model_file = str(self.get_parameter("pose_camera_model_file").value)
+        self.pose_camera_model = (
+            load_pose_camera_model(model_file) if model_file else None
+        )
+        self.pose_camera_model_file = model_file
+        # CameraInfo受信ごとに決まる、実際に使う姿勢用モデル
+        self.active_pose_model = None
+        self.pose_model_error = ""
+        self.realsense_serial_no = None
+        self.serial_mismatch = False
+        self.robust_detector = None
+        self.robust_lock = threading.Lock()
+        self.robust_frame_results = None
 
         self.publish_world_camera_tf = bool(
             self.get_parameter("publish_world_camera_tf").value
@@ -686,6 +765,8 @@ class MultiCharucoDetectorNode(Node):
                 charuco_params.distCoeffs = self.dist_coeffs
                 charuco_detector.setCharucoParameters(charuco_params)
 
+            self.update_pose_model()
+
             self.camera_info_received = True
             self.camera_info_event.set()
             self.camera_info_condition.notify_all()
@@ -696,6 +777,100 @@ class MultiCharucoDetectorNode(Node):
         )
         self.get_logger().info(f"camera_matrix:\n{self.camera_matrix}")
         self.get_logger().info(f"dist_coeffs: {self.dist_coeffs}")
+        if self.active_pose_model is not None:
+            self.get_logger().info(
+                f"pose camera model: {self.active_pose_model['name']} "
+                f"(pipeline={self.pose_pipeline})"
+            )
+        elif self.pose_model_error:
+            self.get_logger().error(self.pose_model_error)
+
+    def update_pose_model(self):
+        """CameraInfoに合わせて姿勢用モデルと高精度検出器を作り直す。"""
+        self.pose_model_error = ""
+        camera_info_model = {
+            "name": "camera_info",
+            "K": self.camera_matrix,
+            "D": self.dist_coeffs,
+        }
+        model = self.pose_camera_model
+        if model is None or self.serial_mismatch:
+            self.active_pose_model = camera_info_model
+        elif camera_model_matches(
+            model,
+            self.camera_info_width,
+            self.camera_info_height,
+            self.camera_matrix,
+        ):
+            self.active_pose_model = model
+        else:
+            message = (
+                f"pose camera model {model['name']} "
+                f"({model['width']}x{model['height']}, "
+                f"{self.pose_camera_model_file}) does not match CameraInfo "
+                f"{self.camera_info_width}x{self.camera_info_height}"
+            )
+            if self.pose_camera_model_mismatch == "camera_info":
+                self.get_logger().warn(f"{message}; using CameraInfo K/D")
+                self.active_pose_model = camera_info_model
+            else:
+                self.active_pose_model = None
+                self.pose_model_error = f"{message}; detection disabled"
+
+        if self.pose_pipeline == "b6_p1_ippe_lm":
+            with self.robust_lock:
+                self.robust_detector = RobustCharucoDetector(
+                    {
+                        entry["config"]["name"]: entry["board"]
+                        for entry in self.board_entries
+                    },
+                    self.aruco_dict,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    self.camera_info_width,
+                    self.camera_info_height,
+                )
+
+    def check_pose_model_for_detection(self):
+        """検出前に姿勢用モデルの適用可否（CameraInfo・serial）を確かめる。"""
+        if self.pose_camera_model is not None and self.pose_camera_model["serial_no"]:
+            try:
+                self.verify_camera_serial()
+            except RuntimeError as error:
+                if self.pose_camera_model_mismatch != "camera_info":
+                    raise
+                self.get_logger().warn(f"{error}; using CameraInfo K/D")
+                self.serial_mismatch = True
+                with self.camera_info_condition:
+                    self.update_pose_model()
+        if self.active_pose_model is None:
+            raise RuntimeError(
+                self.pose_model_error or "pose camera model is not available"
+            )
+
+    def verify_camera_serial(self):
+        """姿勢用モデルにserial_noがあれば、RealSenseノードのserial_noと照合する。"""
+        model = self.pose_camera_model
+        if model is None or not model["serial_no"]:
+            return
+        if self.realsense_serial_no is None:
+            request = GetParameters.Request()
+            request.names = ["serial_no"]
+            response = self.call_parameter_service(
+                self.realsense_get_parameters_client,
+                request,
+                "reading RealSense serial_no",
+            )
+            value = response.values[0] if response.values else None
+            if value is None or value.type != Parameter.Type.STRING.value:
+                raise RuntimeError("RealSense serial_no is not available")
+            self.realsense_serial_no = value.string_value.strip("'\" ")
+        if self.realsense_serial_no != model["serial_no"]:
+            raise RuntimeError(
+                f"pose camera model {model['name']} is for serial "
+                f"{model['serial_no']}, but the camera reports "
+                f"{self.realsense_serial_no}"
+            )
 
     def handle_detect_once(self, request, response):
         del request
@@ -722,6 +897,8 @@ class MultiCharucoDetectorNode(Node):
 
             if not self.camera_info_received:
                 raise RuntimeError("timed out waiting for CameraInfo")
+
+            self.check_pose_model_for_detection()
 
             total_wait_sec = self.detection_window_sec
             if not self.detect_continuously:
@@ -1063,6 +1240,14 @@ class MultiCharucoDetectorNode(Node):
         if not self.frame_is_settled(msg):
             return
 
+        if self.pose_pipeline == "b6_p1_ippe_lm":
+            # 高精度検出は1フレームずつ処理する（検出器と結果を共有するため）。
+            with self.robust_lock:
+                self.process_frame(msg)
+        else:
+            self.process_frame(msg)
+
+    def process_frame(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
@@ -1093,6 +1278,35 @@ class MultiCharucoDetectorNode(Node):
                 all_marker_corners,
                 all_marker_ids,
             )
+
+        self.robust_frame_results = None
+        if self.pose_pipeline == "b6_p1_ippe_lm":
+            model = self.active_pose_model
+            if model is None or self.robust_detector is None:
+                self.get_logger().warn(
+                    self.pose_model_error or "pose camera model not ready",
+                    throttle_duration_sec=2.0,
+                )
+                self.publish_debug_image(debug_frame, msg.header)
+                return
+            try:
+                self.robust_frame_results = self.robust_detector.detect_faces(
+                    frame,
+                    [entry["config"]["name"] for entry in self.board_entries],
+                    model["K"],
+                    model["D"],
+                    visible_ids=(
+                        [] if all_marker_ids is None else all_marker_ids
+                    ),
+                )
+            except (ValueError, cv2.error) as e:
+                # プロファイル切替直後などCameraInfoと画像サイズが食い違うフレーム
+                self.get_logger().warn(
+                    f"robust ChArUco detection skipped: {e}",
+                    throttle_duration_sec=2.0,
+                )
+                self.publish_debug_image(debug_frame, msg.header)
+                return
 
         detected_boards = []
 
@@ -1184,6 +1398,9 @@ class MultiCharucoDetectorNode(Node):
         all_marker_ids,
     ):
         """1つのboard configについて検出と姿勢推定を試す。"""
+
+        if self.pose_pipeline == "b6_p1_ippe_lm":
+            return self.robust_board_result(entry, image_msg, debug_frame)
 
         config = entry["config"]
         charuco_detector = entry["charuco_detector"]
@@ -1302,6 +1519,68 @@ class MultiCharucoDetectorNode(Node):
             "rvec": rvec,
             "tvec": tvec,
         }
+
+    def robust_board_result(self, entry: dict, image_msg: Image, debug_frame):
+        """b6_p1_ippe_lm の1面の結果。品質ゲートを通った面だけ姿勢を返す。"""
+        config = entry["config"]
+        face = (self.robust_frame_results or {}).get(config["name"])
+        if face is None or not face.marker_ids:
+            return None
+
+        cv2.aruco.drawDetectedMarkers(
+            debug_frame,
+            face.marker_corners,
+            np.asarray(face.marker_ids, dtype=np.int32).reshape(-1, 1),
+        )
+        num_corners = int(len(face.charuco_ids))
+        if num_corners > 0:
+            cv2.aruco.drawDetectedCornersCharuco(
+                debug_frame,
+                face.charuco_points.reshape(-1, 1, 2).astype(np.float32),
+                face.charuco_ids.reshape(-1, 1),
+                (0, 255, 255) if face.quality_pass else (0, 0, 255),
+            )
+        result = {
+            "name": config["name"],
+            "cube_name": config["cube_name"],
+            "face_name": config["face_name"],
+            "child_frame": config["child_frame"],
+            "config": config,
+            "num_markers": len(face.marker_ids),
+            "num_corners": num_corners,
+            "pose_success": bool(face.quality_pass),
+            "pose_source": "chessboard" if face.quality_pass else "rejected",
+            "pose_pipeline": self.pose_pipeline,
+            "quality": face.reason,
+            "rmse_px": face.rmse_px,
+            "hull_fraction": face.hull_fraction,
+            "selected_pipeline": face.selected_branch,
+            "model_name": self.active_pose_model["name"],
+        }
+        if not face.quality_pass:
+            return result
+
+        model = self.active_pose_model
+        cv2.drawFrameAxes(
+            debug_frame, model["K"], model["D"], face.rvec, face.tvec, 0.03
+        )
+        self.publish_tf(
+            image_msg=image_msg,
+            child_frame=config["child_frame"],
+            rvec=face.rvec,
+            tvec=face.tvec,
+        )
+        self.draw_board_label(
+            debug_frame=debug_frame,
+            config=config,
+            charuco_corners=face.charuco_points,
+            marker_corners=face.marker_corners,
+            tvec=face.tvec,
+            pose_source=f"{face.selected_branch}/{model['name']}",
+        )
+        result["rvec"] = face.rvec
+        result["tvec"] = face.tvec
+        return result
 
     def estimate_board_pose(
         self,
