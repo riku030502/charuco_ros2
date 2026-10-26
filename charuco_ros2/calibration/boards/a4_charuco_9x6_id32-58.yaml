@@ -1,0 +1,11 @@
+# A4 ChArUco board for RGB intrinsic calibration (printed at 100 %).
+# Same definition as ARGUS plan/history/012/a4_board/board_config.json
+# (plan012_a4_intrinsic_charuco): 9x6 squares, 25 mm squares, 18 mm markers,
+# DICT_4X4_100, marker IDs 32-58, 40 inner ChArUco corners.
+name: a4_charuco_9x6_id32-58
+dictionary: DICT_4X4_100
+squares_x: 9
+squares_y: 6
+square_length_m: 0.025
+marker_length_m: 0.018
+marker_ids: [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

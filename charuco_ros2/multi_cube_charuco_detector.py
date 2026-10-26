@@ -40,6 +40,12 @@ from charuco_ros2.charuco_board_utils import (
     filter_markers_by_ids,
     get_aruco_dictionary,
 )
+from charuco_ros2.calibration.registry import (
+    RegistryError,
+    find_model,
+    normalise_serial,
+    registry_dirs,
+)
 from charuco_ros2.robust_charuco import RobustCharucoDetector
 
 POSE_PIPELINES = ("legacy", "b6_p1_ippe_lm")
@@ -65,7 +71,7 @@ def load_pose_camera_model(path):
         "camera_info_k": np.asarray(
             data["camera_info_k"], dtype=np.float64
         ).reshape(3, 3),
-        "serial_no": str(data.get("serial_no", "")).strip("'\" "),
+        "serial_no": normalise_serial(data.get("serial_no", "")),
         "source": str(data.get("source", "")),
     }
     if model["width"] <= 0 or model["height"] <= 0:
@@ -274,12 +280,18 @@ class MultiCharucoDetectorNode(Node):
         # pose_camera_model_file を指定すると、姿勢推定にそのK/Dを使う
         # （検出の角点補間はCameraInfoのまま）。CameraInfoやserialが一致しない
         # ときは pose_camera_model_mismatch に従う（fail: 検出を失敗させる）。
+        # pose_camera_model_file:=auto は、接続中カメラのserial_noと
+        # CameraInfoの解像度で pose_camera_model_registry（空なら
+        # $CHARUCO_ROS2_INTRINSICS_REGISTRY、~/.config/charuco_ros2/camera_intrinsics）
+        # から検証済みモデルを選ぶ（ARGUS Plan028）。未登録・曖昧・破損は
+        # pose_camera_model_mismatch に従う。
         # キューブ個体校正ファイル（ARGUS Plan025形式のYAML）のリスト。
         # 記載された cube_id/face だけ設計値の代わりに実測 front_T_face を使う。
         self.declare_parameter("cube_calibration_files", [""])
         self.declare_parameter("pose_pipeline", "legacy")
         self.declare_parameter("pose_camera_model_file", "")
         self.declare_parameter("pose_camera_model_mismatch", "fail")
+        self.declare_parameter("pose_camera_model_registry", "")
 
         # =========================
         # World camera link TF
@@ -395,8 +407,14 @@ class MultiCharucoDetectorNode(Node):
                 f"{POSE_MODEL_MISMATCH_ACTIONS}"
             )
         model_file = str(self.get_parameter("pose_camera_model_file").value)
+        self.pose_camera_model_auto = model_file == "auto"
+        self.pose_camera_model_registry = registry_dirs(
+            str(self.get_parameter("pose_camera_model_registry").value)
+        )
         self.pose_camera_model = (
-            load_pose_camera_model(model_file) if model_file else None
+            load_pose_camera_model(model_file)
+            if model_file and not self.pose_camera_model_auto
+            else None
         )
         self.pose_camera_model_file = model_file
         # CameraInfo受信ごとに決まる、実際に使う姿勢用モデル
@@ -853,8 +871,20 @@ class MultiCharucoDetectorNode(Node):
             "K": self.camera_matrix,
             "D": self.dist_coeffs,
         }
+        if self.pose_camera_model_auto and not self.serial_mismatch:
+            self.select_registry_model()
         model = self.pose_camera_model
-        if model is None or self.serial_mismatch:
+        if self.pose_camera_model_auto and model is None and not self.serial_mismatch:
+            if self.pose_camera_model_mismatch == "camera_info" and self.pose_model_error:
+                self.get_logger().warn(f"{self.pose_model_error}; using CameraInfo K/D")
+                self.active_pose_model = camera_info_model
+                self.pose_model_error = ""
+            else:
+                self.active_pose_model = None
+                self.pose_model_error = (
+                    self.pose_model_error or "camera serial_no not read yet"
+                )
+        elif model is None or self.serial_mismatch:
             self.active_pose_model = camera_info_model
         elif camera_model_matches(
             model,
@@ -891,8 +921,49 @@ class MultiCharucoDetectorNode(Node):
                     self.camera_info_height,
                 )
 
+    def select_registry_model(self):
+        """auto: serial_no と CameraInfo解像度でレジストリからモデルを選ぶ。"""
+        self.pose_camera_model = None
+        if self.realsense_serial_no is None:
+            return
+        try:
+            model = find_model(
+                self.realsense_serial_no,
+                self.camera_info_width,
+                self.camera_info_height,
+                stream="color",
+                processing="raw",
+                dirs=self.pose_camera_model_registry,
+            )
+        except RegistryError as error:
+            self.pose_model_error = f"pose camera model registry: {error}"
+            return
+        if "rect" in self.image_topic.rstrip("/").split("/")[-1]:
+            self.pose_model_error = (
+                f"model {model['path']} is for image_raw but image_topic is "
+                f"{self.image_topic} (double correction)"
+            )
+            return
+        self.pose_camera_model = model
+        self.get_logger().info(
+            f"pose camera model (registry): camera {self.realsense_node_name} "
+            f"serial {self.realsense_serial_no} "
+            f"{self.camera_info_width}x{self.camera_info_height} model {model['name']} "
+            f"file {model['path']} sha256 {model['sha256']} fallback none"
+        )
+
     def check_pose_model_for_detection(self):
         """検出前に姿勢用モデルの適用可否（CameraInfo・serial）を確かめる。"""
+        if self.pose_camera_model_auto and self.realsense_serial_no is None:
+            try:
+                self.read_camera_serial()
+            except RuntimeError as error:
+                if self.pose_camera_model_mismatch != "camera_info":
+                    raise
+                self.get_logger().warn(f"{error}; using CameraInfo K/D")
+                self.serial_mismatch = True
+            with self.camera_info_condition:
+                self.update_pose_model()
         if self.pose_camera_model is not None and self.pose_camera_model["serial_no"]:
             try:
                 self.verify_camera_serial()
@@ -914,23 +985,33 @@ class MultiCharucoDetectorNode(Node):
         if model is None or not model["serial_no"]:
             return
         if self.realsense_serial_no is None:
-            request = GetParameters.Request()
-            request.names = ["serial_no"]
-            response = self.call_parameter_service(
-                self.realsense_get_parameters_client,
-                request,
-                "reading RealSense serial_no",
-            )
-            value = response.values[0] if response.values else None
-            if value is None or value.type != Parameter.Type.STRING.value:
-                raise RuntimeError("RealSense serial_no is not available")
-            self.realsense_serial_no = value.string_value.strip("'\" ")
+            self.read_camera_serial()
         if self.realsense_serial_no != model["serial_no"]:
             raise RuntimeError(
                 f"pose camera model {model['name']} is for serial "
                 f"{model['serial_no']}, but the camera reports "
                 f"{self.realsense_serial_no}"
             )
+
+    def read_camera_serial(self):
+        """RealSenseノードのserial_noを読む（起動時の先頭'_'は除く）。空なら失敗。"""
+        request = GetParameters.Request()
+        request.names = ["serial_no"]
+        response = self.call_parameter_service(
+            self.realsense_get_parameters_client,
+            request,
+            "reading RealSense serial_no",
+        )
+        value = response.values[0] if response.values else None
+        if value is None or value.type != Parameter.Type.STRING.value:
+            raise RuntimeError("RealSense serial_no is not available")
+        serial = normalise_serial(value.string_value)
+        if not serial:
+            raise RuntimeError(
+                f"RealSense node {self.realsense_node_name} has an empty serial_no"
+            )
+        self.realsense_serial_no = serial
+        return serial
 
     def handle_detect_once(self, request, response):
         del request

@@ -9,6 +9,7 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
+    package_data={'charuco_ros2.calibration': ['boards/*.yaml', 'page.html']},
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -46,6 +47,10 @@ setup(
             (
                 'charuco_pose_comparator = '
                 'charuco_ros2.charuco_pose_comparator:main'
+            ),
+            (
+                'calibrate_intrinsics = '
+                'charuco_ros2.calibration.cli:main'
             ),
             'generate_charuco_5_7 = charuco_ros2.generate_charuco_5_7:main',
             'detect_charuco = charuco_ros2.detect_charuco:main',

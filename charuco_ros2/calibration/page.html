@@ -1,0 +1,58 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>RGB内部校正</title>
+<style>
+body{font:15px system-ui,sans-serif;margin:16px;color:#17202a;background:#fff;max-width:1500px}
+main{display:grid;grid-template-columns:2fr 1fr;gap:16px}img{width:100%;background:#ddd}
+.box{border:2px solid #94a3b8;border-radius:10px;padding:10px 12px;margin:8px 0}.n{font-weight:800;font-size:34px}
+.ok{color:#15803d}.ng{color:#b91c1c}.small{color:#475569;font-size:13px}li{margin:2px 0}
+button{font:inherit;padding:6px 14px;margin:4px 6px 4px 0;border-radius:8px;border:1px solid #475569;background:#f1f5f9;cursor:pointer}
+button.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}button:disabled{opacity:.45;cursor:default}
+pre{white-space:pre-wrap;font-size:12px;background:#f8fafc;padding:8px;border-radius:6px;max-height:220px;overflow:auto}
+table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #cbd5e1;padding:3px 7px;text-align:right}
+.err{background:#fee2e2;border-color:#b91c1c}@media(max-width:900px){main{grid-template-columns:1fr}}
+</style>
+<h1>RGB内部校正 — ChArUcoボード撮影</h1>
+<p class=small id=cam></p>
+<p class=small>読み取り専用（image_raw と CameraInfo の購読のみ。カメラ設定・ロボットは操作しません）。静止・鮮明・角点12点以上・既存と異なる姿勢を1枚ずつ自動保存します。
+緑の網掛け＝角点が入ったセル、橙の円＝正規化半径0.70、橙の点＝外周の角点。右の判定は目安で、正式なゲートは解析時に保存画像から再判定します。</p>
+<main><section><img id=i alt="ライブ映像"><p id=m>接続中…</p></section><section>
+<div class=box id=errbox hidden></div>
+<div class=box><b>保存数</b><div class=n><span id=n>0</span> / <span id=t>80</span></div>
+<button id=pause>一時停止</button><button id=analyse class=primary>撮影終了して解析</button><p class=small id=o></p></div>
+<div class=box><b>現在のフレーム</b><p id=a>—</p></div>
+<div class=box><b>次に必要な撮影</b><ul id=h></ul></div>
+<div class=box><b>データ十分性ゲート（目安）</b><ul id=g></ul></div>
+<div class=box id=resbox hidden><b>解析結果</b><div id=res></div>
+<label><input type=checkbox id=replace> 同じ個体・解像度の既存登録を置き換える（旧ファイルは history/ に退避）</label><br>
+<button id=register class=primary disabled>このモデルをレジストリに登録</button><p class=small id=regmsg></p></div>
+<div class=box small><b>手順</b><ol><li>中心・四隅・上下左右の端（橙の円の外側）に角点が入るようにボードを動かす</li>
+<li>正面向き（傾き15°未満）を5姿勢以上、30°以上の傾きを10姿勢以上</li><li>各姿勢で1秒ほど静止。ボケ・反射に注意</li></ol></div>
+<div class=box><b>ログ</b><pre id=log></pre></div>
+</section></main>
+<script>
+const label={admitted_poses:'有効姿勢 ≥40',cell_occupancy_8x6:'8×6セル占有率 ≥0.50',outer_corners_calibration:'外周(r≥0.70)角点 ≥50（校正群）',outer_poses:'外周角点を含む姿勢 ≥5',outer_max_single_pose_share:'1姿勢への集中 ≤40%',outer_quadrants_ge5:'外周角点5点以上の象限 ≥3',regions_3x3_ge2_poses:'3×3の全領域に2姿勢以上',frontal_poses_lt15deg:'正面(傾き<15°) ≥5',tilted_poses_ge30deg:'傾斜(≥30°) ≥10'};
+const $=s=>document.querySelector(s);
+function fmt(v){return typeof v==='number'?(Number.isInteger(v)?v:v.toFixed(2)):JSON.stringify(v)}
+function f(v,d=3){return v==null?'—':Number(v).toFixed(d)}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json()}
+$('#pause').onclick=()=>post('/api/pause');
+$('#analyse').onclick=()=>post('/api/analyse');
+$('#register').onclick=async()=>{const r=await post('/api/register',{replace:$('#replace').checked});$('#regmsg').textContent=r.error?('登録できません: '+r.error):('登録しました: '+r.path)};
+async function tick(){try{const x=await fetch('/api/status').then(r=>r.json());const a=x.analysis||{};
+$('#cam').textContent=`カメラ ${x.camera} / serial ${x.serial_no} / レジストリ ${(x.registry||[]).join(' : ')}`+(x.existing_model?` / 既存登録あり: ${x.existing_model}`:'');
+$('#m').textContent=`[${x.phase}] `+(x.message||'');$('#n').textContent=x.saved??0;$('#t').textContent=x.target??'';$('#o').textContent=x.session||'';
+$('#pause').textContent=x.paused?'撮影を再開':'一時停止';$('#pause').disabled=x.phase!=='capture';$('#analyse').disabled=!(x.phase==='capture'||x.phase==='analysed');
+const eb=$('#errbox');if(x.error){eb.hidden=false;eb.className='box err';eb.textContent='停止: '+x.error}else eb.hidden=true;
+$('#a').textContent=`角点 ${a.charuco_n??0} / 傾き ${a.tilt_deg==null?'—':a.tilt_deg.toFixed(1)+'°'} / 距離 ${a.distance_mm==null?'—':a.distance_mm.toFixed(0)+' mm'} / エッジ幅 ${a.width_median_px==null?'—':a.width_median_px.toFixed(2)+' px'} / 動き ${a.motion_px==null||!isFinite(a.motion_px)?'—':a.motion_px.toFixed(2)+' px'}`;
+const h=$('#h');h.innerHTML='';for(const t of (x.hints||[])){const li=document.createElement('li');li.textContent=t;h.appendChild(li)}
+if(!(x.hints||[]).length){const li=document.createElement('li');li.textContent=(x.gate&&x.gate.pass)?'目安ゲートはすべて合格。目標枚数まで多様な姿勢を追加してください':'—';h.appendChild(li)}
+const g=$('#g');g.innerHTML='';for(const[k,v]of Object.entries((x.gate||{}).checks||{})){const li=document.createElement('li');li.className=v.pass?'ok':'ng';li.textContent=(v.pass?'✓ ':'✗ ')+(label[k]||k)+'： '+fmt(v.value);g.appendChild(li)}
+$('#log').textContent=(x.log||[]).join('\n');
+const r=x.report;if(r){$('#resbox').hidden=false;let s=`<p><b>${r.status}</b>：採用 <b>${r.selected}</b>　${r.reason||''}</p>`;
+if(r.failed_gate_rules)s+=`<p class=ng>不合格の規則: ${r.failed_gate_rules.join(', ')}（撮影を再開して追加できます）</p>`;
+if(r.heldout){s+='<table><tr><th>モデル</th><th>保持群RMSE中央値 px</th><th>p95 px</th></tr>';for(const m of Object.keys(r.heldout))s+=`<tr><td>${m}</td><td>${f(r.heldout[m])}</td><td>${f(r.heldout_p95[m])}</td></tr>`;s+='</table>'}
+s+='<p class=small>再投影誤差・安定性は絶対位置精度の保証ではありません。</p>';$('#res').innerHTML=s;
+$('#register').disabled=!(x.phase==='analysed'&&r.candidate_status==='VALIDATED')}
+$('#i').src='/api/overlay?t='+Date.now()}catch(e){$('#m').textContent=String(e)}}
+setInterval(tick,700);tick()
+</script>
