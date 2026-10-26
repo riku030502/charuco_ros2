@@ -1,7 +1,7 @@
 """Live pose collection for intrinsic calibration (ROS-free; the CLI node pushes frames).
 
 One PNG per accepted pose: >= 12 corners, still for 3 analysed frames
-(median corner motion <= 0.5 px), sharp (median edge width <= 4.5 px, valid
+(median corner motion <= 3.0 px), sharp (median edge width <= 4.5 px, valid
 edges >= 80 %) and novel (>= 30 mm or >= 8 deg from every accepted pose).
 Only the newest frame is kept in memory. A CameraInfo change during capture
 stops the collection. The live gate is guidance only; the gate is re-run
@@ -34,7 +34,7 @@ from .quality import (
     split_of,
 )
 
-STILL_PX = 0.5
+STILL_PX = 3.0  # ARGUS Plan028 addendum 2026-10-26: 0.5 px rejected hand-held boards
 STILL_FRAMES = 3
 
 
@@ -80,6 +80,8 @@ class Collector:
                 (self.session / "camera_info.json").read_text(encoding="utf-8")
             )
             self.signature = self.camera["signature"]
+        self.consumed = 0
+        self.analysed_times: list = []
         self._stop = False
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -91,6 +93,11 @@ class Collector:
         with self.lock:
             self.error = message
             self.message = message
+
+    def wants_frame(self) -> bool:
+        """True when the analysis thread took the newest frame (convert nothing before that)."""
+        with self.lock:
+            return self.latest is None or self.latest[3] == self.consumed
 
     def push(self, image: np.ndarray, mapping: dict, stamp: float) -> None:
         with self.lock:
@@ -106,6 +113,9 @@ class Collector:
                 time.sleep(0.03)
                 continue
             image, mapping, stamp, seen = item
+            with self.lock:
+                self.consumed = seen
+            self.analysed_times = (self.analysed_times + [time.time()])[-20:]
             try:
                 self._analyse(image, mapping, stamp)
             except Exception as error:  # noqa: BLE001 - keep the UI alive and show the failure
@@ -271,6 +281,9 @@ class Collector:
         analysis.pop("points", None)
         analysis.pop("ids", None)
         gate = self.live_gate()
+        times = self.analysed_times
+        if len(times) >= 2 and time.time() - times[-1] < 2.0:
+            analysis["analysis_hz"] = (len(times) - 1) / (times[-1] - times[0])
         return {
             "connected": view is not None,
             "message": message,
@@ -286,13 +299,15 @@ class Collector:
         }
 
     def jpeg(self, max_width: int = 960):
+        """Overlay drawn on a downscaled copy (full-resolution drawing starved the analysis)."""
         with self.lock:
             view = self.view
         if view is None or self.camera is None:
             return None
         image, analysis, reason = view
-        image = image.copy()
         height, width = image.shape[:2]
+        f = min(1.0, max_width / width)
+        image = cv2.resize(image, (int(width * f), int(height * f)), interpolation=cv2.INTER_AREA)
         gx, gy = GATE["cell_grid"]
         k0 = np.asarray(self.camera["k"], float).reshape(3, 3)
         occupied, outer = set(), []
@@ -301,7 +316,7 @@ class Collector:
             occupied |= cells(pts, width, height)
             outer.extend(pts[normalised_radius(pts, k0[:2, 2]) >= GATE["outer_radius"]])
         shade = image.copy()
-        cw, ch = width / gx, height / gy
+        cw, ch = width * f / gx, height * f / gy
         for x, y in occupied:
             cv2.rectangle(
                 shade,
@@ -312,26 +327,16 @@ class Collector:
             )
         image = cv2.addWeighted(shade, 0.18, image, 0.82, 0)
         for x in range(1, gx):
-            cv2.line(image, (int(x * cw), 0), (int(x * cw), height), (200, 200, 200), 1)
+            cv2.line(image, (int(x * cw), 0), (int(x * cw), int(height * f)), (200, 200, 200), 1)
         for y in range(1, gy):
-            cv2.line(image, (0, int(y * ch)), (width, int(y * ch)), (200, 200, 200), 1)
-        centre = (int(round(k0[0, 2])), int(round(k0[1, 2])))
-        scale = width / 1920.0
-        cv2.circle(
-            image,
-            centre,
-            int(GATE["outer_radius"] * np.linalg.norm(k0[:2, 2])),
-            (0, 200, 255),
-            max(1, int(2 * scale)),
-        )
+            cv2.line(image, (0, int(y * ch)), (int(width * f), int(y * ch)), (200, 200, 200), 1)
+        centre = (int(round(k0[0, 2] * f)), int(round(k0[1, 2] * f)))
+        radius = int(GATE["outer_radius"] * np.linalg.norm(k0[:2, 2]) * f)
+        cv2.circle(image, centre, radius, (0, 200, 255), 2)
         for x, y in outer:
-            cv2.circle(image, (int(x), int(y)), max(2, int(4 * scale)), (0, 200, 255), -1)
+            cv2.circle(image, (int(x * f), int(y * f)), 2, (0, 200, 255), -1)
         colour = (40, 200, 40) if reason == "saved" else (20, 120, 235)
         for x, y in analysis.get("points", []):
-            cv2.circle(image, (int(round(x)), int(round(y))), max(3, int(6 * scale)), colour, -1)
-        if width > max_width:
-            image = cv2.resize(
-                image, (max_width, int(height * max_width / width)), interpolation=cv2.INTER_AREA
-            )
+            cv2.circle(image, (int(round(x * f)), int(round(y * f))), 3, colour, -1)
         ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return bytes(buffer) if ok else None

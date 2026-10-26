@@ -510,8 +510,8 @@ def run_live(args) -> int:
 
     def on_image(message) -> None:
         info = state["info"]
-        if info is None or session.phase != "capture":
-            return
+        if info is None or session.phase != "capture" or not session.collector.wants_frame():
+            return  # drop before conversion: converting every 6 MB frame starved the analysis
         if (int(message.width), int(message.height)) != (info["width"], info["height"]):
             session.collector.fail(
                 f"画像 {message.width}x{message.height} が CameraInfo "

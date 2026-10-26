@@ -43,7 +43,7 @@ $('#cam').textContent=`カメラ ${x.camera} / serial ${x.serial_no} / レジス
 $('#m').textContent=`[${x.phase}] `+(x.message||'');$('#n').textContent=x.saved??0;$('#t').textContent=x.target??'';$('#o').textContent=x.session||'';
 $('#pause').textContent=x.paused?'撮影を再開':'一時停止';$('#pause').disabled=x.phase!=='capture';$('#analyse').disabled=!(x.phase==='capture'||x.phase==='analysed');
 const eb=$('#errbox');if(x.error){eb.hidden=false;eb.className='box err';eb.textContent='停止: '+x.error}else eb.hidden=true;
-$('#a').textContent=`角点 ${a.charuco_n??0} / 傾き ${a.tilt_deg==null?'—':a.tilt_deg.toFixed(1)+'°'} / 距離 ${a.distance_mm==null?'—':a.distance_mm.toFixed(0)+' mm'} / エッジ幅 ${a.width_median_px==null?'—':a.width_median_px.toFixed(2)+' px'} / 動き ${a.motion_px==null||!isFinite(a.motion_px)?'—':a.motion_px.toFixed(2)+' px'}`;
+$('#a').textContent=`角点 ${a.charuco_n??0} / 傾き ${a.tilt_deg==null?'—':a.tilt_deg.toFixed(1)+'°'} / 距離 ${a.distance_mm==null?'—':a.distance_mm.toFixed(0)+' mm'} / エッジ幅 ${a.width_median_px==null?'—':a.width_median_px.toFixed(2)+' px'} / 動き ${a.motion_px==null||!isFinite(a.motion_px)?'—':a.motion_px.toFixed(2)+' px'} / 解析 ${a.analysis_hz==null?'—':a.analysis_hz.toFixed(1)+' Hz'}`;
 const h=$('#h');h.innerHTML='';for(const t of (x.hints||[])){const li=document.createElement('li');li.textContent=t;h.appendChild(li)}
 if(!(x.hints||[]).length){const li=document.createElement('li');li.textContent=(x.gate&&x.gate.pass)?'目安ゲートはすべて合格。目標枚数まで多様な姿勢を追加してください':'—';h.appendChild(li)}
 const g=$('#g');g.innerHTML='';for(const[k,v]of Object.entries((x.gate||{}).checks||{})){const li=document.createElement('li');li.className=v.pass?'ok':'ng';li.textContent=(v.pass?'✓ ':'✗ ')+(label[k]||k)+'： '+fmt(v.value);g.appendChild(li)}
