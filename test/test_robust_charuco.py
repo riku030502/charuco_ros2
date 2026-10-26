@@ -129,7 +129,7 @@ def test_cube_calibration_file_is_inverted_and_validated():
     front_T_left[:3, 3] = [-0.0049, -0.0008, 0.0450]
     rows = "\n".join(f"- [{', '.join(repr(float(v)) for v in row)}]" for row in front_T_left)
     with tempfile.TemporaryDirectory() as directory:
-        header = "cube_id: left_cube\nface: left\nfront_T_left:\n"
+        header = "cube_id: left_cube\nface: left\nstatus: VALIDATED (test)\nfront_T_left:\n"
         good = _write(directory, "a.yaml", f"{header}{rows}\n")
         result = load_cube_calibrations([good, ""])
         np.testing.assert_allclose(
@@ -137,10 +137,13 @@ def test_cube_calibration_file_is_inverted_and_validated():
         )
         assert load_cube_calibrations([""]) == {}
         for text in (
-            f"cube_id: left_cube\nface: front\nfront_T_front:\n{rows}\n",
-            f"cube_id: other_cube\nface: left\nfront_T_left:\n{rows}\n",
-            "cube_id: left_cube\nface: left\nfront_T_left: [[2, 0, 0, 0], [0, 1, 0, 0], "
-            "[0, 0, 1, 0], [0, 0, 0, 1]]\n",
+            f"cube_id: left_cube\nface: front\nstatus: VALIDATED\nfront_T_front:\n{rows}\n",
+            f"cube_id: left_cube\nface: left\nstatus: ESTIMATED_T_A\nfront_T_left:\n{rows}\n",
+            f"cube_id: left_cube\nface: left\nfront_T_left:\n{rows}\n",
+            f"cube_id: left_cube\nface: right\nstatus: VALIDATED\nfront_T_left:\n{rows}\n",
+            f"cube_id: other_cube\nface: left\nstatus: VALIDATED\nfront_T_left:\n{rows}\n",
+            "cube_id: left_cube\nface: left\nstatus: VALIDATED\n"
+            "front_T_left: [[2, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]\n",
         ):
             bad = _write(directory, "bad.yaml", text)
             try:
@@ -153,3 +156,24 @@ def test_cube_calibration_file_is_inverted_and_validated():
         except ValueError:
             return
         raise AssertionError("duplicate calibration accepted")
+
+
+def test_cube_calibrations_are_keyed_per_cube_and_face():
+    from charuco_ros2.multi_cube_charuco_detector import load_cube_calibrations
+    with tempfile.TemporaryDirectory() as directory:
+        paths = []
+        for index, (cube_id, face) in enumerate(
+            (("left_cube", "left"), ("right_cube", "left"), ("left_cube", "top"))
+        ):
+            matrix = np.eye(4)
+            matrix[0, 3] = 0.001 * (index + 1)
+            rows = "\n".join(f"- [{', '.join(repr(float(v)) for v in row)}]" for row in matrix)
+            paths.append(_write(
+                directory, f"{index}.yaml",
+                f"cube_id: {cube_id}\nface: {face}\nstatus: VALIDATED\nfront_T_{face}:\n{rows}\n",
+            ))
+        result = load_cube_calibrations(paths)
+        assert sorted(result) == [
+            ("left_cube", "left"), ("left_cube", "top"), ("right_cube", "left")
+        ]
+        assert result[("right_cube", "left")]["T_face_front"][0, 3] == -0.002

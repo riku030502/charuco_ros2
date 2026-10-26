@@ -79,6 +79,7 @@ def load_cube_calibrations(paths):
     ファイルの front_T_<face> は face ボード座標をfrontボード座標へ写す
     変換（列ベクトル、m）。ノード内部の T_front_in_face（face_T_front）は
     その逆行列。同じ cube_id/face が重複したら失敗させる。
+    status が VALIDATED で始まらないファイル（未検証の推定値）は読まない。
     """
     calibrations = {}
     for path in [str(value) for value in (paths or []) if str(value).strip()]:
@@ -90,6 +91,10 @@ def load_cube_calibrations(paths):
             raise ValueError(f"unknown cube_id '{cube_id}' in {path}")
         if face not in ("left", "right", "back", "top"):
             raise ValueError(f"face '{face}' cannot be calibrated in {path}")
+        if not str(data.get("status", "")).startswith("VALIDATED"):
+            raise ValueError(f"{cube_id}:{face} calibration is not VALIDATED in {path}")
+        if f"front_T_{face}" not in data:
+            raise ValueError(f"front_T_{face} missing in {path}")
         matrix = np.asarray(data[f"front_T_{face}"], dtype=np.float64)
         if matrix.shape != (4, 4):
             raise ValueError(f"front_T_{face} must be 4x4 in {path}")
