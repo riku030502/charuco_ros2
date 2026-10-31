@@ -198,6 +198,12 @@ def robust_average_pose(translations, quaternions, max_rot_deg, max_trans_m):
     return mean_translation, mean_rotation.as_quat(), inliers, stats
 
 
+# front板原点 -> camera_link の並進 [m]（右・下・奥）
+DESIGN_CAMERA_LINK_IN_FRONT_M = (0.040, 0.070, 0.020)
+# ID 0-39 (left_cube): ARGUS Plan074 物理計測（左指の角＋個体FK、セット1・2平均）、Plan075で本番適用
+LEFT_CUBE_CAMERA_LINK_IN_FRONT_M = (0.03879, 0.06852, 0.02256)
+
+
 class MultiCharucoDetectorNode(Node):
     def __init__(self):
         super().__init__("multi_cube_charuco_detector_node")
@@ -314,6 +320,16 @@ class MultiCharucoDetectorNode(Node):
         self.declare_parameter("save_camera_link_from_cube_tf", True)
         self.declare_parameter("left_cube_camera_link_frame", "left_camera_link")
         self.declare_parameter("right_cube_camera_link_frame", "right_camera_link")
+        # front板原点 -> camera_link の並進 [m]（front板座標：右・下・奥）。回転は設計値のまま。
+        # left_cube (ID 0-39): ARGUS Plan074の物理計測（セット1・2平均、Plan075で本番適用）。
+        #   設計値に戻すときは [0.040, 0.070, 0.020] を指定する。
+        # right_cube (ID 40-79): 設計値のまま（未計測）。
+        self.declare_parameter(
+            "left_cube_camera_link_in_front_m", list(LEFT_CUBE_CAMERA_LINK_IN_FRONT_M)
+        )
+        self.declare_parameter(
+            "right_cube_camera_link_in_front_m", list(DESIGN_CAMERA_LINK_IN_FRONT_M)
+        )
 
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
@@ -558,7 +574,16 @@ class MultiCharucoDetectorNode(Node):
             },
         ]
 
-        T_camera_link_in_front = self._compute_T_camera_link_in_front()
+        T_camera_link_in_front = {
+            cube: self._compute_T_camera_link_in_front(
+                self.get_parameter(f"{cube}_camera_link_in_front_m").value
+            )
+            for cube in ("left_cube", "right_cube")
+        }
+        for cube, T in T_camera_link_in_front.items():
+            self.get_logger().info(
+                f"{cube} front -> camera_link translation [m]: {np.round(T[:3, 3], 5).tolist()}"
+            )
         calibrations = load_cube_calibrations(
             self.get_parameter("cube_calibration_files").value
         )
@@ -576,7 +601,8 @@ class MultiCharucoDetectorNode(Node):
                 )
                 config["face_transform_source"] = "design"
             config["T_camera_link_in_face"] = (
-                config["T_front_in_face"] @ T_camera_link_in_front
+                config["T_front_in_face"]
+                @ T_camera_link_in_front[config["cube_name"]]
             )
         for config in self.board_id_configs:
             self.get_logger().info(
@@ -2053,10 +2079,13 @@ class MultiCharucoDetectorNode(Node):
         return measured_offsets.get(face_name, fallback)
 
     @staticmethod
-    def _compute_T_camera_link_in_front() -> np.ndarray:
+    def _compute_T_camera_link_in_front(
+        translation_m=DESIGN_CAMERA_LINK_IN_FRONT_M,
+    ) -> np.ndarray:
         """front面ボード座標系からcube camera_link相当への変換を返す。
 
-        実測関係: front -> camera_link は 下7.0 cm, 右4.0 cm, 奥2.0 cm。
+        並進 translation_m（front板座標の右・下・奥 [m]）。既定は設計値の
+        下7.0 cm, 右4.0 cm, 奥2.0 cm（ID 0-39はノードのパラメータでPlan074の実測値）。
         回転は現在のcamera_link軸を基準に、緑軸(+Y)まわり反時計回り90度、
         続けて赤軸(+X)まわり時計回り90度、さらに赤軸(+X)まわり180度を
         合成する。
@@ -2081,7 +2110,12 @@ class MultiCharucoDetectorNode(Node):
             [0.0, 0.0, -1.0],
         ])
         T[:3, :3] = R_y_ccw @ R_x_cw @ R_x_180
-        T[:3, 3] = np.array([0.040, 0.070, 0.020], dtype=float)
+        translation = np.asarray(translation_m, dtype=float).reshape(3)
+        if not np.all(np.isfinite(translation)) or np.max(np.abs(translation)) > 0.2:
+            raise ValueError(
+                f"front -> camera_link translation {translation} m is implausible (unit mm/m?)"
+            )
+        T[:3, 3] = translation
         return T
 
     def publish_cube_transforms(self, image_msg: Image, ok_boards: list):
